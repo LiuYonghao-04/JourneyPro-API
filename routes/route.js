@@ -58,4 +58,52 @@ router.get("/recommend", async (req, res) => {
     }
 });
 
+// ✅ 带途径点的路线重规划接口：A → POI → B
+router.get("/with-poi", async (req, res) => {
+    try {
+        const { start, poi, end } = req.query;
+        if (!start || !poi || !end) {
+            return res.status(400).json({
+                success: false,
+                message: "缺少参数：start / poi / end"
+            });
+        }
+
+        // 1️⃣ 组装 OSRM 请求 URL
+        // 例如: http://localhost:5000/route/v1/driving/104.06,30.67;104.04,30.64;104.08,30.70?overview=full&geometries=geojson&steps=true
+        const coordinates = `${start};${poi};${end}`;
+        const url = `${OSRM_URL}/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=true`;
+
+        // 2️⃣ 调用 OSRM 计算路线
+        const osrmRes = await axios.get(url);
+        const data = osrmRes.data;
+
+        if (!data.routes || data.routes.length === 0) {
+            return res.status(404).json({ success: false, message: "未找到可行路线" });
+        }
+
+        const route = data.routes[0];
+
+        // 3️⃣ 返回结果（前端 routeStore.js 会自动接收这些字段）
+        res.json({
+            success: true,
+            optimized_route: {
+                geometry: route.geometry,
+                distance: route.distance,
+                duration: route.duration,
+                legs: route.legs
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ Error in /with-poi:", err.message);
+        res.status(500).json({
+            success: false,
+            message: "服务器内部错误",
+            error: err.message
+        });
+    }
+});
+
+
 export default router;
