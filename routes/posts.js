@@ -64,6 +64,26 @@ async function ensureTables() {
       PRIMARY KEY (post_id, tag_id)
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_comments (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      post_id BIGINT NOT NULL,
+      user_id BIGINT NOT NULL,
+      parent_id BIGINT NULL,
+      content TEXT NOT NULL,
+      like_count INT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS comment_likes (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      comment_id BIGINT NOT NULL,
+      user_id BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_comment_user (comment_id, user_id)
+    );
+  `);
 }
 
 const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
@@ -79,7 +99,12 @@ const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
   rating: row.rating,
   status: row.status,
   created_at: row.created_at,
-  user: userMap[row.id] || { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+  user:
+    userMap[row.id] || {
+      id: row.user_id,
+      nickname: row.nickname || "旅人",
+      avatar_url: row.avatar_url || null,
+    },
 });
 
 async function fetchImages(postIds) {
@@ -161,6 +186,7 @@ router.get("/:id", async (req, res) => {
   try {
     await ensureTables();
     const id = parseInt(req.params.id, 10);
+    await pool.query(`UPDATE posts SET view_count = view_count + 1 WHERE id = ?`, [id]);
     const [[row]] = await pool.query(
       `SELECT p.*, u.nickname, u.avatar_url
        FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ? LIMIT 1`,
@@ -229,11 +255,17 @@ router.post("/:id/like", async (req, res) => {
     await ensureTables();
     const postId = parseInt(req.params.id, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
-    await pool.query(
-      `INSERT IGNORE INTO post_likes (post_id, user_id) VALUES (?, ?)`,
+    const [[existing]] = await pool.query(
+      `SELECT id FROM post_likes WHERE post_id = ? AND user_id = ? LIMIT 1`,
       [postId, userId]
     );
-    await pool.query(`UPDATE posts SET like_count = like_count + 1 WHERE id = ?`, [postId]);
+    if (existing) {
+      await pool.query(`DELETE FROM post_likes WHERE id = ?`, [existing.id]);
+      await pool.query(`UPDATE posts SET like_count = GREATEST(like_count - 1, 0) WHERE id = ?`, [postId]);
+    } else {
+      await pool.query(`INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
+      await pool.query(`UPDATE posts SET like_count = like_count + 1 WHERE id = ?`, [postId]);
+    }
     const [[row]] = await pool.query(
       `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
       [postId]
@@ -241,7 +273,7 @@ router.post("/:id/like", async (req, res) => {
     if (!row) return res.status(404).json({ success: false, message: "not found" });
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap) });
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap), liked: !existing });
   } catch (err) {
     console.error("like post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -253,12 +285,21 @@ router.post("/:id/favorite", async (req, res) => {
     await ensureTables();
     const postId = parseInt(req.params.id, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
-    await pool.query(
-      `INSERT IGNORE INTO post_favorites (post_id, user_id) VALUES (?, ?)`,
+    const [[existing]] = await pool.query(
+      `SELECT id FROM post_favorites WHERE post_id = ? AND user_id = ? LIMIT 1`,
       [postId, userId]
     );
-    await pool.query(`UPDATE posts SET favorite_count = favorite_count + 1 WHERE id = ?`, [postId]);
-    res.json({ success: true });
+    if (existing) {
+      await pool.query(`DELETE FROM post_favorites WHERE id = ?`, [existing.id]);
+      await pool.query(
+        `UPDATE posts SET favorite_count = GREATEST(favorite_count - 1, 0) WHERE id = ?`,
+        [postId]
+      );
+    } else {
+      await pool.query(`INSERT INTO post_favorites (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
+      await pool.query(`UPDATE posts SET favorite_count = favorite_count + 1 WHERE id = ?`, [postId]);
+    }
+    res.json({ success: true, favorited: !existing });
   } catch (err) {
     console.error("fav post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -273,6 +314,124 @@ router.get("/tags/list", async (_req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error("list tags error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// 获取评论列表（含一级+二级）
+router.get("/:id/comments", async (req, res) => {
+  try {
+    await ensureTables();
+    const postId = parseInt(req.params.id, 10);
+    const [rows] = await pool.query(
+      `SELECT c.*, u.nickname, u.avatar_url
+       FROM post_comments c
+       LEFT JOIN users u ON c.user_id = u.id
+       WHERE c.post_id = ?
+       ORDER BY c.created_at ASC`,
+      [postId]
+    );
+    const map = new Map();
+    rows.forEach((r) => {
+      const item = {
+        id: r.id,
+        post_id: r.post_id,
+        user_id: r.user_id,
+        parent_id: r.parent_id,
+        content: r.content,
+        like_count: r.like_count || 0,
+        created_at: r.created_at,
+        user: { id: r.user_id, nickname: r.nickname || "旅人", avatar_url: r.avatar_url || null },
+        replies: [],
+      };
+      map.set(r.id, item);
+    });
+    const roots = [];
+    map.forEach((c) => {
+      if (c.parent_id && map.has(c.parent_id)) {
+        map.get(c.parent_id).replies.push(c);
+      } else {
+        roots.push(c);
+      }
+    });
+    res.json({ success: true, data: roots });
+  } catch (err) {
+    console.error("list comments error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// 新增评论 / 追评
+router.post("/:id/comments", async (req, res) => {
+  try {
+    await ensureTables();
+    const postId = parseInt(req.params.id, 10);
+    const { content, parent_id, user_id } = req.body || {};
+    if (!content) return res.status(400).json({ success: false, message: "content required" });
+    const uid = user_id || DEFAULT_USER_ID;
+    const [r] = await pool.query(
+      `INSERT INTO post_comments (post_id, user_id, parent_id, content) VALUES (?, ?, ?, ?)`,
+      [postId, uid, parent_id || null, content]
+    );
+    const commentId = r.insertId;
+    const [[row]] = await pool.query(
+      `SELECT c.*, u.nickname, u.avatar_url
+       FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
+      [commentId]
+    );
+    const item = {
+      id: row.id,
+      post_id: row.post_id,
+      user_id: row.user_id,
+      parent_id: row.parent_id,
+      content: row.content,
+      like_count: row.like_count || 0,
+      created_at: row.created_at,
+      user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+      replies: [],
+    };
+    res.json({ success: true, data: item });
+  } catch (err) {
+    console.error("create comment error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// 评论点赞/取消
+router.post("/comments/:cid/like", async (req, res) => {
+  try {
+    await ensureTables();
+    const cid = parseInt(req.params.cid, 10);
+    const userId = req.body?.user_id || DEFAULT_USER_ID;
+    const [[existing]] = await pool.query(
+      `SELECT id FROM comment_likes WHERE comment_id = ? AND user_id = ? LIMIT 1`,
+      [cid, userId]
+    );
+    if (existing) {
+      await pool.query(`DELETE FROM comment_likes WHERE id = ?`, [existing.id]);
+      await pool.query(`UPDATE post_comments SET like_count = GREATEST(like_count - 1, 0) WHERE id = ?`, [cid]);
+    } else {
+      await pool.query(`INSERT INTO comment_likes (comment_id, user_id) VALUES (?, ?)`, [cid, userId]);
+      await pool.query(`UPDATE post_comments SET like_count = like_count + 1 WHERE id = ?`, [cid]);
+    }
+    const [[row]] = await pool.query(
+      `SELECT c.*, u.nickname, u.avatar_url
+       FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
+      [cid]
+    );
+    const data = {
+      id: row.id,
+      post_id: row.post_id,
+      user_id: row.user_id,
+      parent_id: row.parent_id,
+      content: row.content,
+      like_count: row.like_count || 0,
+      created_at: row.created_at,
+      user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+    };
+    res.json({ success: true, data, liked: !existing });
+  } catch (err) {
+    console.error("like comment error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });
