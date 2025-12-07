@@ -1,18 +1,48 @@
-# dependencies
+# =========================
+# Dependencies
+# =========================
 node_modules/
 
-# logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
+# =========================
+# Local DB / connection stuff
+# (You said: do not upload db)
+# =========================
+db/
 
-# env
+# =========================
+# Environment variables
+# =========================
 .env
 .env.*
+*.env
 
-# OS / editor
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# =========================
+# Runtime / build caches
+# =========================
+dist/
+build/
+.cache/
+.tmp/
+temp/
+
+# =========================
+# OS files
+# =========================
 .DS_Store
+Thumbs.db
 
-# JetBrains
+# =========================
+# IDE / Editor
+# =========================
 .idea/
+.vscode/
+*.iml
