@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import routeRouter from "./routes/route.js";
 import replanRouter from "./routes/replan.js";
 import authRouter from "./routes/auth.js";
+import postsRouter from "./routes/posts.js";
 
 dotenv.config();
 
@@ -14,6 +15,7 @@ app.use(express.json());
 app.use("/api/route", routeRouter);
 app.use("/api/route", replanRouter);
 app.use("/api/auth", authRouter);
+app.use("/api/posts", postsRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
