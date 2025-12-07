@@ -156,6 +156,25 @@ router.get("/", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "30", 10), 50);
     const offset = parseInt(req.query.offset || "0", 10);
     const sort = req.query.sort === "hot" ? "hot" : "latest";
+    const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
+    const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
+    const favoritedBy = req.query.favorited_by ? parseInt(req.query.favorited_by, 10) : null;
+
+    let where = "p.status = 'NORMAL'";
+    const params = [];
+    if (userId) {
+      where += " AND p.user_id = ?";
+      params.push(userId);
+    }
+    if (likedBy) {
+      where += " AND EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = ?)";
+      params.push(likedBy);
+    }
+    if (favoritedBy) {
+      where += " AND EXISTS (SELECT 1 FROM post_favorites pf WHERE pf.post_id = p.id AND pf.user_id = ?)";
+      params.push(favoritedBy);
+    }
+
     const orderBy =
       sort === "hot"
         ? "p.view_count DESC, p.like_count DESC, p.favorite_count DESC, p.created_at DESC"
@@ -165,10 +184,10 @@ router.get("/", async (req, res) => {
       `SELECT p.*, u.nickname, u.avatar_url
        FROM posts p
        LEFT JOIN users u ON p.user_id = u.id
-       WHERE p.status = 'NORMAL'
+       WHERE ${where}
        ORDER BY ${orderBy}
        LIMIT ? OFFSET ?`,
-      [limit, offset]
+      [...params, limit, offset]
     );
     const ids = rows.map((r) => r.id);
     const imagesMap = await fetchImages(ids);
