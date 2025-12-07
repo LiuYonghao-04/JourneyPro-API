@@ -5,8 +5,8 @@ import { getNearbyPOIs } from "../models/poi.js";
 const router = express.Router();
 
 // OSRM 本地服务端口
-// const OSRM_URL = "http://localhost:5000";
-const OSRM_URL = "https://router.project-osrm.org";
+const OSRM_URL = "http://localhost:5000";
+// const OSRM_URL = "https://router.project-osrm.org";
 
 // /api/route/recommend?start=lng,lat&end=lng,lat
 router.get("/recommend", async (req, res) => {
