@@ -318,7 +318,13 @@ router.post("/:id/favorite", async (req, res) => {
       await pool.query(`INSERT INTO post_favorites (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
       await pool.query(`UPDATE posts SET favorite_count = favorite_count + 1 WHERE id = ?`, [postId]);
     }
-    res.json({ success: true, favorited: !existing });
+    const [[row]] = await pool.query(
+      `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
+      [postId]
+    );
+    const imagesMap = await fetchImages([postId]);
+    const tagsMap = await fetchTags([postId]);
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap), favorited: !existing });
   } catch (err) {
     console.error("fav post error", err);
     res.status(500).json({ success: false, message: "server error" });
