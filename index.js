@@ -6,6 +6,7 @@ import replanRouter from "./routes/replan.js";
 import authRouter from "./routes/auth.js";
 import postsRouter from "./routes/posts.js";
 import seedRouter from "./routes/seed.js";
+import poiRouter from "./routes/poi.js";
 
 dotenv.config();
 
@@ -18,6 +19,7 @@ app.use("/api/route", replanRouter);
 app.use("/api/auth", authRouter);
 app.use("/api/posts", postsRouter);
 app.use("/api/dev", seedRouter);
+app.use("/api/poi", poiRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {

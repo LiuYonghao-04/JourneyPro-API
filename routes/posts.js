@@ -4,6 +4,22 @@ import { pool } from "../db/connect.js";
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
 
+async function tryAlter(sql) {
+  try {
+    await pool.query(sql);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // swallow benign duplicate errors
+    if (
+      !msg.includes("Duplicate column") &&
+      !msg.includes("check that column/key exists") &&
+      !msg.includes("Unknown column 'parent_id'")
+    ) {
+      console.error("alter table failed:", msg);
+    }
+  }
+}
+
 async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS posts (
@@ -69,10 +85,14 @@ async function ensureTables() {
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
       user_id BIGINT NOT NULL,
-      parent_id BIGINT NULL,
+      parent_comment_id BIGINT NULL,
+      type VARCHAR(20) DEFAULT 'COMMENT',
       content TEXT NOT NULL,
       like_count INT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      reply_count INT DEFAULT 0,
+      status VARCHAR(20) DEFAULT 'NORMAL',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     );
   `);
   await pool.query(`
@@ -84,6 +104,15 @@ async function ensureTables() {
       UNIQUE KEY uk_comment_user (comment_id, user_id)
     );
   `);
+  // lightweight migrations for older schemas
+  await tryAlter(`ALTER TABLE post_comments CHANGE COLUMN parent_id parent_comment_id BIGINT NULL`);
+  await tryAlter(`ALTER TABLE post_comments ADD COLUMN type VARCHAR(20) DEFAULT 'COMMENT'`);
+  await tryAlter(`ALTER TABLE post_comments ADD COLUMN reply_count INT DEFAULT 0`);
+  await tryAlter(`ALTER TABLE post_comments ADD COLUMN status VARCHAR(20) DEFAULT 'NORMAL'`);
+  await tryAlter(
+    `ALTER TABLE post_comments ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+  );
+  await tryAlter(`ALTER TABLE posts MODIFY poi_id BIGINT NULL DEFAULT NULL`);
 }
 
 const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
@@ -233,15 +262,24 @@ router.post("/", async (req, res) => {
       images = [],
       tags = [],
     } = req.body || {};
-    if (!title || !content) {
-      return res.status(400).json({ success: false, message: "title/content required" });
+    const missing = [];
+    if (!title) missing.push("title");
+    if (!content) missing.push("content");
+    if (!Array.isArray(images) || images.length === 0) missing.push("images");
+    if (!Array.isArray(tags) || tags.length === 0) missing.push("tags");
+    if (missing.length > 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: `Missing required field(s): ${missing.join(", ")}` });
     }
     const authorId = user_id || DEFAULT_USER_ID;
+    const poiVal =
+      poi_id === null || poi_id === undefined || poi_id === "" ? null : Number.isNaN(Number(poi_id)) ? null : poi_id;
     const cover = images[0] || null;
     const [result] = await pool.query(
       `INSERT INTO posts (user_id, poi_id, title, content, rating, cover_image, image_count)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [authorId, poi_id || null, title, content, rating || null, cover, images.length]
+      [authorId, poiVal, title, content, rating || null, cover, images.length]
     );
     const postId = result.insertId;
 
@@ -348,24 +386,28 @@ router.get("/:id/comments", async (req, res) => {
   try {
     await ensureTables();
     const postId = parseInt(req.params.id, 10);
+    const viewerId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const [rows] = await pool.query(
-      `SELECT c.*, u.nickname, u.avatar_url
+      `SELECT c.*, u.nickname, u.avatar_url, ${viewerId ? "IF(cl.id IS NULL, 0, 1)" : "0"} AS liked_by_user
        FROM post_comments c
        LEFT JOIN users u ON c.user_id = u.id
+       ${viewerId ? "LEFT JOIN comment_likes cl ON cl.comment_id = c.id AND cl.user_id = ?" : ""}
        WHERE c.post_id = ?
        ORDER BY c.created_at ASC`,
-      [postId]
+      viewerId ? [viewerId, postId] : [postId]
     );
     const map = new Map();
     rows.forEach((r) => {
+      const parentId = r.parent_comment_id ?? r.parent_id;
       const item = {
         id: r.id,
         post_id: r.post_id,
         user_id: r.user_id,
-        parent_id: r.parent_id,
+        parent_id: parentId,
         content: r.content,
         like_count: r.like_count || 0,
         created_at: r.created_at,
+        liked_by_user: !!r.liked_by_user,
         user: { id: r.user_id, nickname: r.nickname || "旅人", avatar_url: r.avatar_url || null },
         replies: [],
       };
@@ -391,14 +433,19 @@ router.post("/:id/comments", async (req, res) => {
   try {
     await ensureTables();
     const postId = parseInt(req.params.id, 10);
-    const { content, parent_id, user_id } = req.body || {};
+    const { content, parent_id, parent_comment_id, user_id } = req.body || {};
     if (!content) return res.status(400).json({ success: false, message: "content required" });
     const uid = user_id || DEFAULT_USER_ID;
+    const parentId = parent_comment_id || parent_id || null;
+    const type = parentId ? "REPLY" : "COMMENT";
     const [r] = await pool.query(
-      `INSERT INTO post_comments (post_id, user_id, parent_id, content) VALUES (?, ?, ?, ?)`,
-      [postId, uid, parent_id || null, content]
+      `INSERT INTO post_comments (post_id, user_id, parent_comment_id, type, content) VALUES (?, ?, ?, ?, ?)`,
+      [postId, uid, parentId, type, content]
     );
     const commentId = r.insertId;
+    if (parentId) {
+      await pool.query(`UPDATE post_comments SET reply_count = reply_count + 1 WHERE id = ?`, [parentId]);
+    }
     const [[row]] = await pool.query(
       `SELECT c.*, u.nickname, u.avatar_url
        FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
@@ -408,7 +455,7 @@ router.post("/:id/comments", async (req, res) => {
       id: row.id,
       post_id: row.post_id,
       user_id: row.user_id,
-      parent_id: row.parent_id,
+      parent_id: row.parent_comment_id ?? row.parent_id,
       content: row.content,
       like_count: row.like_count || 0,
       created_at: row.created_at,
@@ -439,21 +486,21 @@ router.post("/comments/:cid/like", async (req, res) => {
       await pool.query(`INSERT INTO comment_likes (comment_id, user_id) VALUES (?, ?)`, [cid, userId]);
       await pool.query(`UPDATE post_comments SET like_count = like_count + 1 WHERE id = ?`, [cid]);
     }
-    const [[row]] = await pool.query(
-      `SELECT c.*, u.nickname, u.avatar_url
-       FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
-      [cid]
-    );
-    const data = {
-      id: row.id,
-      post_id: row.post_id,
-      user_id: row.user_id,
-      parent_id: row.parent_id,
-      content: row.content,
-      like_count: row.like_count || 0,
-      created_at: row.created_at,
-      user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
-    };
+  const [[row]] = await pool.query(
+    `SELECT c.*, u.nickname, u.avatar_url
+     FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
+    [cid]
+  );
+  const data = {
+    id: row.id,
+    post_id: row.post_id,
+    user_id: row.user_id,
+    parent_id: row.parent_comment_id ?? row.parent_id,
+    content: row.content,
+    like_count: row.like_count || 0,
+    created_at: row.created_at,
+    user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+  };
     res.json({ success: true, data, liked: !existing });
   } catch (err) {
     console.error("like comment error", err);
