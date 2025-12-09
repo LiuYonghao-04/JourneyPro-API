@@ -27,4 +27,21 @@ router.get("/search", async (req, res) => {
   }
 });
 
+// GET /api/poi/:id
+router.get("/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, message: "invalid id" });
+    const [[row]] = await pool.query(
+      `SELECT id, name, category, lat, lng, popularity, price, tags, image_url FROM poi WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    if (!row) return res.status(404).json({ success: false, message: "not found" });
+    res.json({ success: true, data: row });
+  } catch (err) {
+    console.error("poi detail error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
 export default router;

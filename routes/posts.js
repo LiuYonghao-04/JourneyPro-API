@@ -118,6 +118,7 @@ async function ensureTables() {
 
 const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
   id: row.id,
+  poi_id: row.poi_id,
   title: row.title,
   content: row.content,
   cover_image: row.cover_image,
@@ -279,8 +280,21 @@ router.post("/", async (req, res) => {
         .json({ success: false, message: `Missing required field(s): ${missing.join(", ")}` });
     }
     const authorId = user_id || DEFAULT_USER_ID;
-    const poiVal =
-      poi_id === null || poi_id === undefined || poi_id === "" ? null : Number.isNaN(Number(poi_id)) ? null : poi_id;
+    let poiVal =
+      poi_id === null || poi_id === undefined || poi_id === ""
+        ? null
+        : Number.isNaN(Number(poi_id))
+        ? null
+        : Number(poi_id);
+    if (poiVal) {
+      const [[poiRow]] = await pool.query(`SELECT id FROM poi WHERE id = ? LIMIT 1`, [poiVal]);
+      if (!poiRow) {
+        return res.status(400).json({ success: false, message: "poi_id does not exist" });
+      }
+      poiVal = poiRow.id;
+    } else {
+      poiVal = null;
+    }
     const cover = images[0] || null;
     const [result] = await pool.query(
       `INSERT INTO posts (user_id, poi_id, title, content, rating, cover_image, image_count)
