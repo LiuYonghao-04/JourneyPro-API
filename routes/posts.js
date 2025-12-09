@@ -1,5 +1,6 @@
 import express from "express";
 import { pool } from "../db/connect.js";
+import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
@@ -135,6 +136,11 @@ const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
       avatar_url: row.avatar_url || null,
     },
 });
+
+async function fetchUserProfile(userId) {
+  const [[u]] = await pool.query(`SELECT id, nickname, avatar_url FROM users WHERE id = ? LIMIT 1`, [userId]);
+  return u || { id: userId, nickname: "旅人", avatar_url: null };
+}
 
 async function fetchImages(postIds) {
   if (postIds.length === 0) return new Map();
@@ -316,12 +322,14 @@ router.post("/:id/like", async (req, res) => {
       `SELECT id FROM post_likes WHERE post_id = ? AND user_id = ? LIMIT 1`,
       [postId, userId]
     );
+    let liked = false;
     if (existing) {
       await pool.query(`DELETE FROM post_likes WHERE id = ?`, [existing.id]);
       await pool.query(`UPDATE posts SET like_count = GREATEST(like_count - 1, 0) WHERE id = ?`, [postId]);
     } else {
       await pool.query(`INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
       await pool.query(`UPDATE posts SET like_count = like_count + 1 WHERE id = ?`, [postId]);
+      liked = true;
     }
     const [[row]] = await pool.query(
       `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
@@ -330,6 +338,17 @@ router.post("/:id/like", async (req, res) => {
     if (!row) return res.status(404).json({ success: false, message: "not found" });
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
+    if (liked && row.user_id && row.user_id !== userId) {
+      const actor = await fetchUserProfile(userId);
+      pushNotification(row.user_id, {
+        type: "like",
+        actor_id: userId,
+        actor_nickname: actor.nickname,
+        actor_avatar: actor.avatar_url,
+        post_id: postId,
+        title: row.title,
+      });
+    }
     res.json({ success: true, data: normalize(row, imagesMap, tagsMap), liked: !existing });
   } catch (err) {
     console.error("like post error", err);
@@ -346,6 +365,7 @@ router.post("/:id/favorite", async (req, res) => {
       `SELECT id FROM post_favorites WHERE post_id = ? AND user_id = ? LIMIT 1`,
       [postId, userId]
     );
+    let favored = false;
     if (existing) {
       await pool.query(`DELETE FROM post_favorites WHERE id = ?`, [existing.id]);
       await pool.query(
@@ -355,6 +375,7 @@ router.post("/:id/favorite", async (req, res) => {
     } else {
       await pool.query(`INSERT INTO post_favorites (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
       await pool.query(`UPDATE posts SET favorite_count = favorite_count + 1 WHERE id = ?`, [postId]);
+      favored = true;
     }
     const [[row]] = await pool.query(
       `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
@@ -362,6 +383,17 @@ router.post("/:id/favorite", async (req, res) => {
     );
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
+    if (favored && row.user_id && row.user_id !== userId) {
+      const actor = await fetchUserProfile(userId);
+      pushNotification(row.user_id, {
+        type: "favorite",
+        actor_id: userId,
+        actor_nickname: actor.nickname,
+        actor_avatar: actor.avatar_url,
+        post_id: postId,
+        title: row.title,
+      });
+    }
     res.json({ success: true, data: normalize(row, imagesMap, tagsMap), favorited: !existing });
   } catch (err) {
     console.error("fav post error", err);
@@ -443,6 +475,19 @@ router.post("/:id/comments", async (req, res) => {
       [postId, uid, parentId, type, content]
     );
     const commentId = r.insertId;
+    const [[postRow]] = await pool.query(`SELECT user_id, title FROM posts WHERE id = ? LIMIT 1`, [postId]);
+    if (postRow?.user_id && postRow.user_id !== uid) {
+      const actor = await fetchUserProfile(uid);
+      pushNotification(postRow.user_id, {
+        type: "comment",
+        actor_id: uid,
+        actor_nickname: actor.nickname,
+        actor_avatar: actor.avatar_url,
+        post_id: postId,
+        title: postRow.title,
+        content,
+      });
+    }
     if (parentId) {
       await pool.query(`UPDATE post_comments SET reply_count = reply_count + 1 WHERE id = ?`, [parentId]);
     }

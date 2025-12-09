@@ -1,5 +1,6 @@
 import express from "express";
 import { pool } from "../db/connect.js";
+import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
 
@@ -20,14 +21,14 @@ async function ensureFollowTable() {
   try {
     await pool.query(`CREATE INDEX idx_follows_follower ON user_follows(follower_id)`);
   } catch (e) {
-    if (!String(e?.message || "").includes("already exists")) {
+    if (e?.code !== "ER_DUP_KEYNAME") {
       console.error("create idx_follows_follower error", e);
     }
   }
   try {
     await pool.query(`CREATE INDEX idx_follows_following ON user_follows(following_id)`);
   } catch (e) {
-    if (!String(e?.message || "").includes("already exists")) {
+    if (e?.code !== "ER_DUP_KEYNAME") {
       console.error("create idx_follows_following error", e);
     }
   }
@@ -73,6 +74,20 @@ router.post("/toggle", async (req, res) => {
       followerId,
       targetId,
     ]);
+    // push follow notification
+    try {
+      const [[actor]] = await pool.query(`SELECT id, nickname, avatar_url FROM users WHERE id = ? LIMIT 1`, [
+        followerId,
+      ]);
+      pushNotification(targetId, {
+        type: "follow",
+        actor_id: followerId,
+        actor_nickname: actor?.nickname,
+        actor_avatar: actor?.avatar_url,
+      });
+    } catch (e) {
+      // ignore
+    }
     res.json({ success: true, following: true });
   } catch (err) {
     console.error("follow toggle error", err);
