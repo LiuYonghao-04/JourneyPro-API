@@ -9,6 +9,7 @@ import seedRouter from "./routes/seed.js";
 import poiRouter from "./routes/poi.js";
 import followRouter from "./routes/follow.js";
 import notificationsRouter from "./routes/notifications.js";
+import chatRouter from "./routes/chat.js";
 
 dotenv.config();
 
@@ -24,6 +25,7 @@ app.use("/api/dev", seedRouter);
 app.use("/api/poi", poiRouter);
 app.use("/api/follow", followRouter);
 app.use("/api/notifications", notificationsRouter);
+app.use("/api/chat", chatRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
