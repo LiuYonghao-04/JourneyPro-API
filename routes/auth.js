@@ -69,4 +69,22 @@ router.post("/login", async (req, res) => {
   }
 });
 
+// GET /api/auth/user?id=123
+router.get("/user", async (req, res) => {
+  try {
+    const id = parseInt(req.query.id || "0", 10);
+    if (!id) {
+      return res.status(400).json({ success: false, message: "id required" });
+    }
+    const [rows] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [id]);
+    if (!rows.length) {
+      return res.status(404).json({ success: false, message: "user not found" });
+    }
+    res.json({ success: true, user: mapUser(rows[0]) });
+  } catch (err) {
+    console.error("fetch user error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
 export default router;
