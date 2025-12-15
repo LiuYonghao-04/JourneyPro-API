@@ -1,5 +1,6 @@
 import express from "express";
 import { pool } from "../db/connect.js";
+import { getNearbyPOIs } from "../models/poi.js";
 
 const router = express.Router();
 
@@ -23,6 +24,27 @@ router.get("/search", async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error("poi search error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// GET /api/poi/nearby?lat=..&lng=..&radius=1000&limit=20&category=food
+router.get("/nearby", async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    const radius = parseInt(req.query.radius || "1000", 10);
+    const limit = parseInt(req.query.limit || "20", 10);
+    const category = (req.query.category || "").trim();
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ success: false, message: "lat/lng required" });
+    }
+
+    const rows = await getNearbyPOIs(lat, lng, radius, limit, category || null);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error("poi nearby error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });
