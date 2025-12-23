@@ -1,6 +1,7 @@
 import express from "express";
 import axios from "axios";
 import { getNearbyPOIs } from "../models/poi.js";
+import { pool } from "../db/connect.js";
 
 const router = express.Router();
 
@@ -55,7 +56,206 @@ const sampleRoutePoints = (coords, stepM, maxSamples) => {
   return samples;
 };
 
-// GET /api/route/recommend?start=lng,lat&end=lng,lat&radius=700&limit=10&sample_m=350&category=museum
+const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+const parseLngLat = (value) => {
+  const [lng, lat] = String(value || "").split(",").map(Number);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  return { lng, lat };
+};
+
+const parseViaPoints = (value) => {
+  if (!value) return [];
+  return String(value)
+    .split(";")
+    .map((pair) => parseLngLat(pair))
+    .filter(Boolean);
+};
+
+const parseTagList = (value) => {
+  if (!value) return [];
+  return String(value)
+    .split(/[,;|/]+/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+};
+
+const toWeightMap = (rows, keyField, keyTransform = (v) => v) => {
+  const map = new Map();
+  rows.forEach((row) => {
+    const raw = row?.[keyField];
+    if (raw === null || raw === undefined || raw === "") return;
+    const key = keyTransform(raw);
+    const weight = Number(row.weight) || 0;
+    map.set(key, weight);
+  });
+  return map;
+};
+
+const maxWeight = (map) => {
+  let max = 0;
+  for (const value of map.values()) {
+    if (value > max) max = value;
+  }
+  return max;
+};
+
+let ensurePreferenceTablesPromise = null;
+const ensurePreferenceTables = async () => {
+  if (!ensurePreferenceTablesPromise) {
+    ensurePreferenceTablesPromise = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS post_views (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          post_id BIGINT NOT NULL,
+          user_id BIGINT NOT NULL,
+          view_count INT DEFAULT 1,
+          last_viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_post_user_view (post_id, user_id)
+        );
+      `)
+      .catch((err) => {
+        ensurePreferenceTablesPromise = null;
+        throw err;
+      });
+  }
+  await ensurePreferenceTablesPromise;
+};
+
+const fetchUserPreferences = async (userId) => {
+  if (!userId) {
+    return {
+      tagWeights: new Map(),
+      categoryWeights: new Map(),
+      poiWeights: new Map(),
+      maxTagWeight: 0,
+      maxCategoryWeight: 0,
+      maxPoiWeight: 0,
+      topTags: [],
+      topCategories: [],
+      hasProfile: false,
+    };
+  }
+
+  try {
+    await ensurePreferenceTables();
+  } catch (err) {
+    console.warn("preference tables unavailable", err);
+    return {
+      tagWeights: new Map(),
+      categoryWeights: new Map(),
+      poiWeights: new Map(),
+      maxTagWeight: 0,
+      maxCategoryWeight: 0,
+      maxPoiWeight: 0,
+      topTags: [],
+      topCategories: [],
+      hasProfile: false,
+    };
+  }
+
+  const params = [userId, userId, userId];
+  const interactionSql = `
+    SELECT post_id, SUM(weight) AS weight
+    FROM (
+      SELECT post_id, 3 AS weight FROM post_likes WHERE user_id = ?
+      UNION ALL
+      SELECT post_id, 5 AS weight FROM post_favorites WHERE user_id = ?
+      UNION ALL
+      SELECT post_id, LEAST(view_count, 6) AS weight FROM post_views WHERE user_id = ?
+    ) t
+    GROUP BY post_id
+  `;
+
+  let tagRows = [];
+  let categoryRows = [];
+  let poiRows = [];
+  try {
+    [tagRows] = await pool.query(
+      `
+        SELECT t.name AS tag, SUM(i.weight) AS weight
+        FROM (${interactionSql}) i
+        JOIN post_tags pt ON pt.post_id = i.post_id
+        JOIN tags t ON t.id = pt.tag_id
+        GROUP BY t.name
+      `,
+      params
+    );
+    [categoryRows] = await pool.query(
+      `
+        SELECT poi.category AS category, SUM(i.weight) AS weight
+        FROM (${interactionSql}) i
+        JOIN posts p ON p.id = i.post_id
+        JOIN poi ON poi.id = p.poi_id
+        WHERE poi.category IS NOT NULL AND poi.category <> ''
+        GROUP BY poi.category
+      `,
+      params
+    );
+    [poiRows] = await pool.query(
+      `
+        SELECT p.poi_id AS poi_id, SUM(i.weight) AS weight
+        FROM (${interactionSql}) i
+        JOIN posts p ON p.id = i.post_id
+        WHERE p.poi_id IS NOT NULL
+        GROUP BY p.poi_id
+      `,
+      params
+    );
+  } catch (err) {
+    console.warn("preference query failed", err);
+  }
+
+  const tagWeights = toWeightMap(tagRows, "tag", (v) => String(v));
+  const categoryWeights = toWeightMap(categoryRows, "category", (v) => String(v));
+  const poiWeights = toWeightMap(poiRows, "poi_id", (v) => Number(v));
+
+  const maxTagWeight = maxWeight(tagWeights);
+  const maxCategoryWeight = maxWeight(categoryWeights);
+  const maxPoiWeight = maxWeight(poiWeights);
+
+  const topTags = [...tagWeights.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([tag]) => tag);
+  const topCategories = [...categoryWeights.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([cat]) => cat);
+
+  return {
+    tagWeights,
+    categoryWeights,
+    poiWeights,
+    maxTagWeight,
+    maxCategoryWeight,
+    maxPoiWeight,
+    topTags,
+    topCategories,
+    hasProfile: maxTagWeight > 0 || maxCategoryWeight > 0 || maxPoiWeight > 0,
+  };
+};
+
+const buildReason = ({ personalScore, bestDistanceKm, startKm, endKm, topTag, popScore }) => {
+  if (personalScore >= 0.45 && topTag) {
+    return `Matches your interests: ${topTag}`;
+  }
+  if (bestDistanceKm <= 0.35) {
+    return "Right along your route";
+  }
+  if (startKm <= 0.6) {
+    return "Near your start";
+  }
+  if (endKm <= 0.6) {
+    return "Near your destination";
+  }
+  if (popScore >= 0.7) {
+    return "Popular nearby";
+  }
+  return "Good fit for your route";
+};
+
+// GET /api/route/recommend?start=lng,lat&end=lng,lat&via=lng,lat;lng,lat&user_id=1&radius=700&limit=10&sample_m=350&category=museum
 router.get("/recommend", async (req, res) => {
   try {
     const { start, end } = req.query;
@@ -63,20 +263,25 @@ router.get("/recommend", async (req, res) => {
       return res.status(400).json({ error: "Missing start or end parameters" });
     }
 
-    const [startLng, startLat] = String(start).split(",").map(Number);
-    const [endLng, endLat] = String(end).split(",").map(Number);
-    if (![startLng, startLat, endLng, endLat].every((n) => Number.isFinite(n))) {
+    const startPoint = parseLngLat(start);
+    const endPoint = parseLngLat(end);
+    const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
+    const viaPoints = parseViaPoints(req.query.via);
+    if (!startPoint || !endPoint) {
       return res.status(400).json({ error: "Invalid start/end format" });
     }
 
-    const radius = Math.min(Math.max(parseInt(req.query.radius || "700", 10), 50), 20000);
-    const limit = Math.min(Math.max(parseInt(req.query.limit || "10", 10), 1), 50);
-    const perSampleLimit = Math.min(Math.max(parseInt(req.query.per_sample_limit || "18", 10), 1), 60);
-    const requestedSampleM = Math.min(Math.max(parseInt(req.query.sample_m || "350", 10), 150), 1200);
+    const radius = clamp(parseInt(req.query.radius || "700", 10) || 700, 50, 20000);
+    const limit = clamp(parseInt(req.query.limit || "10", 10) || 10, 1, 50);
+    const perSampleLimit = clamp(parseInt(req.query.per_sample_limit || "18", 10) || 18, 1, 60);
+    const requestedSampleM = clamp(parseInt(req.query.sample_m || "350", 10) || 350, 150, 1200);
     const category = (req.query.category || "").toString().trim();
 
+    const waypoints = [startPoint, ...viaPoints, endPoint];
+    const coordString = waypoints.map((p) => `${p.lng},${p.lat}`).join(";");
+
     const osrmRes = await axios.get(
-      `${OSRM_URL}/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`
+      `${OSRM_URL}/route/v1/driving/${coordString}?overview=full&geometries=geojson`
     );
     const route = osrmRes.data?.routes?.[0];
     if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates)) {
@@ -105,13 +310,59 @@ router.get("/recommend", async (req, res) => {
       }
     }
 
+    const preferences = await fetchUserPreferences(userId);
+
     const scored = Array.from(byId.values()).map((p) => {
       const popularity = Number(p.popularity) || 0;
       const km = (Number(p.bestDistance) || 0) / 1000;
-      const popScore = Math.max(Math.min(popularity / 5, 1), 0);
+      const startKm = haversineMeters(p.lat, p.lng, startPoint.lat, startPoint.lng) / 1000;
+      const endKm = haversineMeters(p.lat, p.lng, endPoint.lat, endPoint.lng) / 1000;
+
+      const popScore = clamp(popularity / 5, 0, 1);
       const distScore = 1 / (km + 1);
-      const hitScore = Math.max(Math.min((Number(p.hits) || 0) / 3, 1), 0);
-      const score = popScore * 0.45 + distScore * 0.35 + hitScore * 0.2;
+      const startScore = 1 / (startKm + 1);
+      const endScore = 1 / (endKm + 1);
+      const endpointScore = (startScore + endScore) / 2;
+      const hitScore = clamp((Number(p.hits) || 0) / 3, 0, 1);
+
+      const poiWeight = preferences.poiWeights.get(Number(p.id)) || 0;
+      const poiScore = preferences.maxPoiWeight ? poiWeight / preferences.maxPoiWeight : 0;
+
+      const tagList = parseTagList(p.tags);
+      const uniqueTags = [...new Set(tagList)];
+      const tagWeights = uniqueTags.map((tag) => preferences.tagWeights.get(tag) || 0);
+      const tagScoreRaw = tagWeights.reduce((sum, v) => sum + v, 0);
+      const tagScore = preferences.maxTagWeight ? tagScoreRaw / preferences.maxTagWeight : 0;
+
+      const categoryLabel = p.category ? String(p.category) : "";
+      const categoryWeight = categoryLabel ? preferences.categoryWeights.get(categoryLabel) || 0 : 0;
+      const categoryScore = preferences.maxCategoryWeight ? categoryWeight / preferences.maxCategoryWeight : 0;
+
+      const personalScore = preferences.hasProfile
+        ? tagScore * 0.5 + categoryScore * 0.2 + poiScore * 0.3
+        : 0;
+
+      const score = preferences.hasProfile
+        ? distScore * 0.3 + endpointScore * 0.15 + popScore * 0.15 + hitScore * 0.1 + personalScore * 0.3
+        : distScore * 0.4 + endpointScore * 0.2 + popScore * 0.25 + hitScore * 0.15;
+
+      let topTag = null;
+      let topTagWeight = 0;
+      uniqueTags.forEach((tag) => {
+        const weight = preferences.tagWeights.get(tag) || 0;
+        if (weight > topTagWeight) {
+          topTag = tag;
+          topTagWeight = weight;
+        }
+      });
+      if (!topTag && categoryWeight > 0) {
+        topTag = categoryLabel;
+      }
+
+      const matchTags = uniqueTags.filter((tag) => preferences.tagWeights.get(tag));
+      if (categoryLabel && categoryWeight > 0 && !matchTags.includes(categoryLabel)) {
+        matchTags.push(categoryLabel);
+      }
 
       return {
         id: p.id,
@@ -120,9 +371,21 @@ router.get("/recommend", async (req, res) => {
         lat: p.lat,
         lng: p.lng,
         distance: Math.round(Number(p.bestDistance) || Number(p.distance) || 0),
+        distance_to_start: Math.round(startKm * 1000),
+        distance_to_end: Math.round(endKm * 1000),
         popularity: p.popularity,
         score,
         image_url: p.image_url,
+        reason: buildReason({
+          personalScore,
+          bestDistanceKm: km,
+          startKm,
+          endKm,
+          topTag,
+          popScore,
+        }),
+        match_tags: matchTags,
+        personal_score: personalScore,
       };
     });
 
@@ -132,6 +395,12 @@ router.get("/recommend", async (req, res) => {
     res.json({
       base_route: route,
       recommended_pois: topPois,
+      profile: {
+        user_id: userId || null,
+        tags: preferences.topTags,
+        categories: preferences.topCategories,
+        personalized: preferences.hasProfile,
+      },
       debug: {
         osrm: OSRM_URL,
         sample_m: sampleM,
@@ -188,4 +457,3 @@ router.get("/with-poi", async (req, res) => {
 });
 
 export default router;
-

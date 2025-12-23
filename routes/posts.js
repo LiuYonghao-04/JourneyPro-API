@@ -67,6 +67,16 @@ async function ensureTables() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_views (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      post_id BIGINT NOT NULL,
+      user_id BIGINT NOT NULL,
+      view_count INT DEFAULT 1,
+      last_viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_post_user_view (post_id, user_id)
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS tags (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(50) NOT NULL UNIQUE,
@@ -241,7 +251,16 @@ router.get("/:id", async (req, res) => {
   try {
     await ensureTables();
     const id = parseInt(req.params.id, 10);
+    const viewerId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     await pool.query(`UPDATE posts SET view_count = view_count + 1 WHERE id = ?`, [id]);
+    if (viewerId) {
+      await pool.query(
+        `INSERT INTO post_views (post_id, user_id, view_count)
+         VALUES (?, ?, 1)
+         ON DUPLICATE KEY UPDATE view_count = view_count + 1, last_viewed_at = CURRENT_TIMESTAMP`,
+        [id, viewerId]
+      );
+    }
     const [[row]] = await pool.query(
       `SELECT p.*, u.nickname, u.avatar_url
        FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ? LIMIT 1`,
