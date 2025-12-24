@@ -28,6 +28,32 @@ const ensureViewsTable = async () => {
   await ensureViewsTablePromise;
 };
 
+let ensureSettingsTablePromise = null;
+const ensureSettingsTable = async () => {
+  if (!ensureSettingsTablePromise) {
+    ensureSettingsTablePromise = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS user_recommendation_settings (
+          user_id BIGINT PRIMARY KEY,
+          interest_weight FLOAT NOT NULL DEFAULT 0.5,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
+      `)
+      .catch((err) => {
+        ensureSettingsTablePromise = null;
+        throw err;
+      });
+  }
+  await ensureSettingsTablePromise;
+};
+
+const parseInterestWeight = (value) => {
+  let weight = Number(value);
+  if (!Number.isFinite(weight)) weight = 0.5;
+  if (weight > 1) weight /= 100;
+  return clamp(weight, 0, 1);
+};
+
 const safeRows = async (sql, params = []) => {
   try {
     const [rows] = await pool.query(sql, params);
@@ -65,6 +91,85 @@ const buildPercentList = (rows, limit) => {
     other_percent: total ? round1((otherWeight / total) * 100) : 0,
   };
 };
+
+// GET /api/recommendation/settings?user_id=1
+router.get("/settings", async (req, res) => {
+  try {
+    const userId = parseInt(req.query.user_id || "0", 10);
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "user_id required" });
+    }
+
+    await ensureSettingsTable();
+
+    const [[userRow]] = await pool.query(`SELECT id FROM users WHERE id = ? LIMIT 1`, [userId]);
+    if (!userRow) {
+      return res.status(404).json({ success: false, message: "user not found" });
+    }
+
+    const [[row]] = await pool.query(
+      `SELECT interest_weight, updated_at FROM user_recommendation_settings WHERE user_id = ? LIMIT 1`,
+      [userId]
+    );
+    const interestWeight = parseInterestWeight(row?.interest_weight);
+    res.json({
+      success: true,
+      user_id: userId,
+      interest_weight: interestWeight,
+      distance_weight: 1 - interestWeight,
+      updated_at: row?.updated_at || null,
+      exists: !!row,
+    });
+  } catch (err) {
+    console.error("recommendation settings get error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// POST /api/recommendation/settings  { user_id, interest_weight }
+router.post("/settings", async (req, res) => {
+  try {
+    const userId = parseInt(req.body?.user_id || "0", 10);
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "user_id required" });
+    }
+
+    await ensureSettingsTable();
+
+    const [[userRow]] = await pool.query(`SELECT id FROM users WHERE id = ? LIMIT 1`, [userId]);
+    if (!userRow) {
+      return res.status(404).json({ success: false, message: "user not found" });
+    }
+
+    const interestWeight = parseInterestWeight(req.body?.interest_weight);
+
+    await pool.query(
+      `
+        INSERT INTO user_recommendation_settings (user_id, interest_weight)
+        VALUES (?, ?)
+        ON DUPLICATE KEY UPDATE interest_weight = VALUES(interest_weight), updated_at = CURRENT_TIMESTAMP
+      `,
+      [userId, interestWeight]
+    );
+
+    const [[row]] = await pool.query(
+      `SELECT interest_weight, updated_at FROM user_recommendation_settings WHERE user_id = ? LIMIT 1`,
+      [userId]
+    );
+
+    const saved = parseInterestWeight(row?.interest_weight);
+    res.json({
+      success: true,
+      user_id: userId,
+      interest_weight: saved,
+      distance_weight: 1 - saved,
+      updated_at: row?.updated_at || null,
+    });
+  } catch (err) {
+    console.error("recommendation settings save error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
 
 // GET /api/recommendation/profile?user_id=1&limit=6
 router.get("/profile", async (req, res) => {
@@ -145,4 +250,3 @@ router.get("/profile", async (req, res) => {
 });
 
 export default router;
-

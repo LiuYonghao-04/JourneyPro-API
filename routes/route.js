@@ -354,6 +354,9 @@ router.get("/recommend", async (req, res) => {
         ? clamp(personalScore * 0.65 + popScore * 0.2 + hitScore * 0.15, 0, 1)
         : clamp(popScore * 0.65 + hitScore * 0.35, 0, 1);
 
+      // Selection should not depend on the user's tuning slider.
+      const baseScore = distanceComponent * 0.5 + interestComponent * 0.5;
+      // Tuning only changes ranking order.
       const score = distanceComponent * distanceWeight + interestComponent * interestWeight;
 
       let topTag = null;
@@ -384,6 +387,9 @@ router.get("/recommend", async (req, res) => {
         distance_to_start: Math.round(startKm * 1000),
         distance_to_end: Math.round(endKm * 1000),
         popularity: p.popularity,
+        base_score: baseScore,
+        distance_score: distanceComponent,
+        interest_score: interestComponent,
         score,
         image_url: p.image_url,
         reason: buildReason({
@@ -399,8 +405,19 @@ router.get("/recommend", async (req, res) => {
       };
     });
 
-    scored.sort((a, b) => b.score - a.score);
-    const topPois = scored.slice(0, limit);
+    // Keep the same recommended set (per route/user) and only reorder when tuning changes.
+    const selected = [...scored]
+      .sort((a, b) => (b.base_score || 0) - (a.base_score || 0))
+      .slice(0, limit);
+    selected.sort(
+      (a, b) =>
+        (b.score || 0) - (a.score || 0) ||
+        (b.base_score || 0) - (a.base_score || 0) ||
+        (Number(b.popularity) || 0) - (Number(a.popularity) || 0) ||
+        (Number(a.distance) || 0) - (Number(b.distance) || 0) ||
+        (Number(a.id) || 0) - (Number(b.id) || 0)
+    );
+    const topPois = selected;
 
     res.json({
       base_route: route,
