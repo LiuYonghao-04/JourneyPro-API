@@ -14,6 +14,7 @@ import followRouter from "./routes/follow.js";
 import notificationsRouter from "./routes/notifications.js";
 import chatRouter from "./routes/chat.js";
 import uploadRouter from "./routes/upload.js";
+import recommendationRouter from "./routes/recommendation.js";
 
 dotenv.config();
 
@@ -35,9 +36,9 @@ app.use("/api/follow", followRouter);
 app.use("/api/notifications", notificationsRouter);
 app.use("/api/chat", chatRouter);
 app.use("/api/upload", uploadRouter);
+app.use("/api/recommendation", recommendationRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`JourneyPro API running at http://localhost:${PORT}`);
 });
-

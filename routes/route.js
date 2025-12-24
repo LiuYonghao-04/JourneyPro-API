@@ -277,6 +277,13 @@ router.get("/recommend", async (req, res) => {
     const requestedSampleM = clamp(parseInt(req.query.sample_m || "350", 10) || 350, 150, 1200);
     const category = (req.query.category || "").toString().trim();
 
+    let interestWeight = Number(req.query.interest_weight);
+    if (!Number.isFinite(interestWeight)) interestWeight = 0.5;
+    // Support both 0..1 and 0..100 (percent) inputs.
+    if (interestWeight > 1) interestWeight /= 100;
+    interestWeight = clamp(interestWeight, 0, 1);
+    const distanceWeight = 1 - interestWeight;
+
     const waypoints = [startPoint, ...viaPoints, endPoint];
     const coordString = waypoints.map((p) => `${p.lng},${p.lat}`).join(";");
 
@@ -342,9 +349,12 @@ router.get("/recommend", async (req, res) => {
         ? tagScore * 0.5 + categoryScore * 0.2 + poiScore * 0.3
         : 0;
 
-      const score = preferences.hasProfile
-        ? distScore * 0.3 + endpointScore * 0.15 + popScore * 0.15 + hitScore * 0.1 + personalScore * 0.3
-        : distScore * 0.4 + endpointScore * 0.2 + popScore * 0.25 + hitScore * 0.15;
+      const distanceComponent = clamp(distScore * 0.7 + endpointScore * 0.3, 0, 1);
+      const interestComponent = preferences.hasProfile
+        ? clamp(personalScore * 0.65 + popScore * 0.2 + hitScore * 0.15, 0, 1)
+        : clamp(popScore * 0.65 + hitScore * 0.35, 0, 1);
+
+      const score = distanceComponent * distanceWeight + interestComponent * interestWeight;
 
       let topTag = null;
       let topTagWeight = 0;
@@ -400,6 +410,10 @@ router.get("/recommend", async (req, res) => {
         tags: preferences.topTags,
         categories: preferences.topCategories,
         personalized: preferences.hasProfile,
+        tuning: {
+          interest_weight: interestWeight,
+          distance_weight: distanceWeight,
+        },
       },
       debug: {
         osrm: OSRM_URL,
