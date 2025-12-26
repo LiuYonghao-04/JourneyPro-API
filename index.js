@@ -1,6 +1,6 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -15,8 +15,6 @@ import notificationsRouter from "./routes/notifications.js";
 import chatRouter from "./routes/chat.js";
 import uploadRouter from "./routes/upload.js";
 import recommendationRouter from "./routes/recommendation.js";
-
-dotenv.config();
 
 const app = express();
 app.use(cors());

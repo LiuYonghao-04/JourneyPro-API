@@ -15,6 +15,7 @@ db/
 .env
 .env.*
 *.env
+!.env.example
 
 # =========================
 # Logs

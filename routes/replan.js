@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 
 const router = express.Router();
-const OSRM_URL = "http://localhost:5000";
+const OSRM_URL = process.env.OSRM_URL || "http://localhost:5000";
 
 // GET /api/route/with-poi?start=lng,lat&poi=lng,lat&end=lng,lat
 router.get("/with-poi", async (req, res) => {

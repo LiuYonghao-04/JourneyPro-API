@@ -4,7 +4,7 @@
 // - Avoids bus stops to keep dataset reasonable
 // - Upserts into poi using unique(source, source_id)
 
-const mysql = require("mysql2/promise");
+import mysql from "mysql2/promise";
 
 // ====== DB CONFIG (env) ======
 const DB = {

@@ -2,10 +2,10 @@
 // Import filtered OSM POIs (NDJSON) into MySQL with upsert.
 // Keeps only food/attraction/park (configurable) to avoid junk like barrier=cycle_barrier.
 
-const fs = require("fs");
-const readline = require("readline");
-const turf = require("@turf/turf");
-const mysql = require("mysql2/promise");
+import * as fs from "fs";
+import * as readline from "readline";
+import * as turf from "@turf/turf";
+import mysql from "mysql2/promise";
 
 const NDJSON_PATH =
     process.env.NDJSON_PATH ||

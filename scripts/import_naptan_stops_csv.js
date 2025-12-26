@@ -3,8 +3,11 @@
 // Source: DfT NaPTAN CSV download (free, no API calls).
 // Keeps station-like StopType values, excludes on-street bus stops (BCT).
 
-const fs = require("fs");
-const mysql = require("mysql2/promise");
+import * as fs from "fs";
+import mysql from "mysql2/promise";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
 const { parse } = require("csv-parse");
 
 const DB = {
