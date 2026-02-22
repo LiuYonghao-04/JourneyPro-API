@@ -205,6 +205,7 @@ router.get("/", async (req, res) => {
     const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
     const favoritedBy = req.query.favorited_by ? parseInt(req.query.favorited_by, 10) : null;
+    const poiId = req.query.poi_id ? parseInt(req.query.poi_id, 10) : null;
 
     let where = "p.status = 'NORMAL'";
     const params = [];
@@ -219,6 +220,10 @@ router.get("/", async (req, res) => {
     if (favoritedBy) {
       where += " AND EXISTS (SELECT 1 FROM post_favorites pf WHERE pf.post_id = p.id AND pf.user_id = ?)";
       params.push(favoritedBy);
+    }
+    if (poiId) {
+      where += " AND p.poi_id = ?";
+      params.push(poiId);
     }
 
     const orderBy =
