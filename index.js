@@ -15,6 +15,7 @@ import notificationsRouter from "./routes/notifications.js";
 import chatRouter from "./routes/chat.js";
 import uploadRouter from "./routes/upload.js";
 import recommendationRouter from "./routes/recommendation.js";
+import recoEventsRouter from "./routes/recoEvents.js";
 
 const app = express();
 app.use(cors());
@@ -35,6 +36,7 @@ app.use("/api/notifications", notificationsRouter);
 app.use("/api/chat", chatRouter);
 app.use("/api/upload", uploadRouter);
 app.use("/api/recommendation", recommendationRouter);
+app.use("/api/recommendation", recoEventsRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {

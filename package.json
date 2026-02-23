@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "reco:backfill": "node scripts/reco_backfill.js",
+    "reco:offline": "node scripts/reco_offline_aggregate.js"
   },
   "keywords": [],
   "author": "",

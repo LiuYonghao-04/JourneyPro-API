@@ -1,58 +1,14 @@
-import express from "express";
+﻿import express from "express";
 import { pool } from "../db/connect.js";
+import { clamp, round } from "../services/reco/constants.js";
+import {
+  ensureUserExists,
+  fetchUserRecommendationSettings,
+  saveUserRecommendationSettings,
+} from "../services/reco/profiles.js";
+import { ensureRecoTables } from "../services/reco/schema.js";
 
 const router = express.Router();
-
-const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
-const round1 = (value) => Math.round(Number(value || 0) * 10) / 10;
-
-let ensureViewsTablePromise = null;
-const ensureViewsTable = async () => {
-  if (!ensureViewsTablePromise) {
-    ensureViewsTablePromise = pool
-      .query(`
-        CREATE TABLE IF NOT EXISTS post_views (
-          id BIGINT AUTO_INCREMENT PRIMARY KEY,
-          post_id BIGINT NOT NULL,
-          user_id BIGINT NOT NULL,
-          view_count INT DEFAULT 1,
-          last_viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          UNIQUE KEY uk_post_user_view (post_id, user_id)
-        );
-      `)
-      .catch((err) => {
-        ensureViewsTablePromise = null;
-        throw err;
-      });
-  }
-  await ensureViewsTablePromise;
-};
-
-let ensureSettingsTablePromise = null;
-const ensureSettingsTable = async () => {
-  if (!ensureSettingsTablePromise) {
-    ensureSettingsTablePromise = pool
-      .query(`
-        CREATE TABLE IF NOT EXISTS user_recommendation_settings (
-          user_id BIGINT PRIMARY KEY,
-          interest_weight FLOAT NOT NULL DEFAULT 0.5,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        );
-      `)
-      .catch((err) => {
-        ensureSettingsTablePromise = null;
-        throw err;
-      });
-  }
-  await ensureSettingsTablePromise;
-};
-
-const parseInterestWeight = (value) => {
-  let weight = Number(value);
-  if (!Number.isFinite(weight)) weight = 0.5;
-  if (weight > 1) weight /= 100;
-  return clamp(weight, 0, 1);
-};
 
 const safeRows = async (sql, params = []) => {
   try {
@@ -73,52 +29,81 @@ const safeScalar = async (sql, params = [], field = "count", defaultValue = 0) =
 
 const buildPercentList = (rows, limit) => {
   const normalized = (rows || [])
-    .map((r) => ({ name: r.name, weight: Number(r.weight) || 0 }))
-    .filter((r) => r.name && r.weight > 0);
+    .map((row) => ({ name: row.name, weight: Number(row.weight ?? row.score ?? 0) || 0 }))
+    .filter((row) => row.name && row.weight > 0);
 
-  const total = normalized.reduce((sum, r) => sum + r.weight, 0);
-  const top = normalized.slice(0, limit).map((r) => ({
-    name: r.name,
-    weight: r.weight,
-    percent: total ? round1((r.weight / total) * 100) : 0,
+  const total = normalized.reduce((sum, row) => sum + row.weight, 0);
+  const top = normalized.slice(0, limit).map((row) => ({
+    name: row.name,
+    weight: row.weight,
+    percent: total ? round((row.weight / total) * 100, 1) : 0,
   }));
-  const topWeight = top.reduce((sum, r) => sum + r.weight, 0);
+  const topWeight = top.reduce((sum, row) => sum + row.weight, 0);
   const otherWeight = Math.max(total - topWeight, 0);
 
   return {
     total_weight: total,
     items: top,
-    other_percent: total ? round1((otherWeight / total) * 100) : 0,
+    other_percent: total ? round((otherWeight / total) * 100, 1) : 0,
+  };
+};
+
+const fetchProfileFromAgg = async (userId, limit) => {
+  const rows = await safeRows(
+    `
+      SELECT feature_type, feature_key, score
+      FROM user_interest_agg
+      WHERE user_id = ?
+      ORDER BY score DESC
+      LIMIT 400
+    `,
+    [userId]
+  );
+
+  if (!rows.length) return null;
+
+  const tags = rows
+    .filter((row) => row.feature_type === "tag")
+    .map((row) => ({ name: row.feature_key, score: Number(row.score) || 0 }));
+  const categories = rows
+    .filter((row) => row.feature_type === "category")
+    .map((row) => ({ name: row.feature_key, score: Number(row.score) || 0 }));
+
+  if (!tags.length && !categories.length) return null;
+
+  return {
+    tags: buildPercentList(tags, limit),
+    categories: buildPercentList(categories, limit),
+    source: "user_interest_agg",
   };
 };
 
 // GET /api/recommendation/settings?user_id=1
 router.get("/settings", async (req, res) => {
   try {
-    const userId = parseInt(req.query.user_id || "0", 10);
+    const userId = Number.parseInt(req.query.user_id || "0", 10);
     if (!userId) {
       return res.status(400).json({ success: false, message: "user_id required" });
     }
 
-    await ensureSettingsTable();
+    await ensureRecoTables();
 
-    const [[userRow]] = await pool.query(`SELECT id FROM users WHERE id = ? LIMIT 1`, [userId]);
-    if (!userRow) {
+    const userExists = await ensureUserExists(userId);
+    if (!userExists) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
 
-    const [[row]] = await pool.query(
-      `SELECT interest_weight, updated_at FROM user_recommendation_settings WHERE user_id = ? LIMIT 1`,
-      [userId]
-    );
-    const interestWeight = parseInterestWeight(row?.interest_weight);
+    const settings = await fetchUserRecommendationSettings(userId);
+
     res.json({
       success: true,
       user_id: userId,
-      interest_weight: interestWeight,
-      distance_weight: 1 - interestWeight,
-      updated_at: row?.updated_at || null,
-      exists: !!row,
+      interest_weight: settings.interestWeight,
+      distance_weight: settings.distanceWeight,
+      explore_weight: settings.exploreWeight,
+      mode_defaults: settings.modeDefaults,
+      updated_at: settings.updatedAt,
+      exists: settings.exists,
     });
   } catch (err) {
     console.error("recommendation settings get error", err);
@@ -126,44 +111,36 @@ router.get("/settings", async (req, res) => {
   }
 });
 
-// POST /api/recommendation/settings  { user_id, interest_weight }
+// POST /api/recommendation/settings
+// { user_id, interest_weight, explore_weight, mode_defaults }
 router.post("/settings", async (req, res) => {
   try {
-    const userId = parseInt(req.body?.user_id || "0", 10);
+    const userId = Number.parseInt(req.body?.user_id || "0", 10);
     if (!userId) {
       return res.status(400).json({ success: false, message: "user_id required" });
     }
 
-    await ensureSettingsTable();
+    await ensureRecoTables();
 
-    const [[userRow]] = await pool.query(`SELECT id FROM users WHERE id = ? LIMIT 1`, [userId]);
-    if (!userRow) {
+    const userExists = await ensureUserExists(userId);
+    if (!userExists) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
 
-    const interestWeight = parseInterestWeight(req.body?.interest_weight);
+    const settings = await saveUserRecommendationSettings(userId, {
+      interestWeight: req.body?.interest_weight,
+      exploreWeight: req.body?.explore_weight,
+      modeDefaults: req.body?.mode_defaults,
+    });
 
-    await pool.query(
-      `
-        INSERT INTO user_recommendation_settings (user_id, interest_weight)
-        VALUES (?, ?)
-        ON DUPLICATE KEY UPDATE interest_weight = VALUES(interest_weight), updated_at = CURRENT_TIMESTAMP
-      `,
-      [userId, interestWeight]
-    );
-
-    const [[row]] = await pool.query(
-      `SELECT interest_weight, updated_at FROM user_recommendation_settings WHERE user_id = ? LIMIT 1`,
-      [userId]
-    );
-
-    const saved = parseInterestWeight(row?.interest_weight);
     res.json({
       success: true,
       user_id: userId,
-      interest_weight: saved,
-      distance_weight: 1 - saved,
-      updated_at: row?.updated_at || null,
+      interest_weight: settings.interestWeight,
+      distance_weight: settings.distanceWeight,
+      explore_weight: settings.exploreWeight,
+      mode_defaults: settings.modeDefaults,
+      updated_at: settings.updatedAt,
     });
   } catch (err) {
     console.error("recommendation settings save error", err);
@@ -174,16 +151,34 @@ router.post("/settings", async (req, res) => {
 // GET /api/recommendation/profile?user_id=1&limit=6
 router.get("/profile", async (req, res) => {
   try {
-    const userId = parseInt(req.query.user_id || "0", 10);
-    const limit = clamp(parseInt(req.query.limit || "6", 10) || 6, 1, 20);
+    const userId = Number.parseInt(req.query.user_id || "0", 10);
+    const limit = clamp(Number.parseInt(req.query.limit || "6", 10) || 6, 1, 20);
     if (!userId) {
       return res.status(400).json({ success: false, message: "user_id required" });
     }
 
-    try {
-      await ensureViewsTable();
-    } catch {
-      // ignore
+    await ensureRecoTables();
+
+    const aggProfile = await fetchProfileFromAgg(userId, limit);
+
+    const likes = await safeScalar(`SELECT COUNT(*) AS count FROM post_likes WHERE user_id = ?`, [userId]);
+    const favorites = await safeScalar(`SELECT COUNT(*) AS count FROM post_favorites WHERE user_id = ?`, [userId]);
+    const views = await safeScalar(`SELECT COALESCE(SUM(view_count), 0) AS count FROM post_views WHERE user_id = ?`, [
+      userId,
+    ]);
+
+    if (aggProfile) {
+      const personalized = aggProfile.tags.total_weight > 0 || aggProfile.categories.total_weight > 0;
+      return res.json({
+        success: true,
+        user_id: userId,
+        personalized,
+        source: aggProfile.source,
+        signals: { likes, favorites, views },
+        tags: aggProfile.tags,
+        categories: aggProfile.categories,
+        generated_at: new Date().toISOString(),
+      });
     }
 
     const params = [userId, userId, userId];
@@ -224,12 +219,6 @@ router.get("/profile", async (req, res) => {
       params
     );
 
-    const likes = await safeScalar(`SELECT COUNT(*) AS count FROM post_likes WHERE user_id = ?`, [userId]);
-    const favorites = await safeScalar(`SELECT COUNT(*) AS count FROM post_favorites WHERE user_id = ?`, [userId]);
-    const views = await safeScalar(`SELECT COALESCE(SUM(view_count), 0) AS count FROM post_views WHERE user_id = ?`, [
-      userId,
-    ]);
-
     const tagProfile = buildPercentList(tagRows, limit);
     const categoryProfile = buildPercentList(categoryRows, limit);
     const personalized = tagProfile.total_weight > 0 || categoryProfile.total_weight > 0;
@@ -238,6 +227,7 @@ router.get("/profile", async (req, res) => {
       success: true,
       user_id: userId,
       personalized,
+      source: "fallback_posts",
       signals: { likes, favorites, views },
       tags: tagProfile,
       categories: categoryProfile,
