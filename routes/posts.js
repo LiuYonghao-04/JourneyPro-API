@@ -4,6 +4,18 @@ import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
+const POST_SELECT_FIELDS = `
+  p.*,
+  u.nickname,
+  u.avatar_url,
+  poi.name AS poi_name,
+  poi.category AS poi_category,
+  poi.lat AS poi_lat,
+  poi.lng AS poi_lng,
+  poi.image_url AS poi_image_url,
+  poi.address AS poi_address,
+  poi.city AS poi_city
+`;
 
 async function tryAlter(sql) {
   try {
@@ -30,7 +42,7 @@ async function ensureTables() {
       title VARCHAR(100) NOT NULL,
       content TEXT NOT NULL,
       rating TINYINT NULL,
-      cover_image VARCHAR(255) NULL,
+      cover_image VARCHAR(600) NULL,
       image_count INT DEFAULT 0,
       like_count INT DEFAULT 0,
       favorite_count INT DEFAULT 0,
@@ -44,8 +56,21 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS post_images (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
-      image_url VARCHAR(255) NOT NULL,
+      image_url VARCHAR(600) NOT NULL,
       sort_order INT DEFAULT 0
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS poi_photos (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      poi_id BIGINT NOT NULL,
+      image_url VARCHAR(600) NOT NULL,
+      source VARCHAR(40) NOT NULL DEFAULT 'AUTO',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_poi_photo (poi_id, image_url(255)),
+      INDEX idx_poi_sort (poi_id, sort_order, id)
     );
   `);
   await pool.query(`
@@ -124,9 +149,11 @@ async function ensureTables() {
     `ALTER TABLE post_comments ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
   );
   await tryAlter(`ALTER TABLE posts MODIFY poi_id BIGINT NULL DEFAULT NULL`);
+  await tryAlter(`ALTER TABLE posts MODIFY cover_image VARCHAR(600) NULL`);
+  await tryAlter(`ALTER TABLE post_images MODIFY image_url VARCHAR(600) NOT NULL`);
 }
 
-const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
+const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = {}) => ({
   id: row.id,
   poi_id: row.poi_id,
   title: row.title,
@@ -140,6 +167,19 @@ const normalize = (row, imagesMap, tagsMap, userMap = {}) => ({
   rating: row.rating,
   status: row.status,
   created_at: row.created_at,
+  poi: row.poi_id
+    ? {
+        id: row.poi_id,
+        name: row.poi_name || null,
+        category: row.poi_category || null,
+        lat: Number.isFinite(Number(row.poi_lat)) ? Number(row.poi_lat) : null,
+        lng: Number.isFinite(Number(row.poi_lng)) ? Number(row.poi_lng) : null,
+        image_url: row.poi_image_url || null,
+        address: row.poi_address || null,
+        city: row.poi_city || null,
+        photos: poiPhotosMap.get(Number(row.poi_id)) || (row.poi_image_url ? [row.poi_image_url] : []),
+      }
+    : null,
   user:
     userMap[row.id] || {
       id: row.user_id,
@@ -177,6 +217,35 @@ async function fetchTags(postIds) {
   rows.forEach((r) => {
     if (!map.has(r.post_id)) map.set(r.post_id, []);
     map.get(r.post_id).push(r.name);
+  });
+  return map;
+}
+
+async function fetchPoiPhotosByIds(poiIds, limitPerPoi = 6) {
+  const ids = [...new Set((poiIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return new Map();
+
+  const [rows] = await pool.query(
+    `
+      SELECT poi_id, image_url
+      FROM (
+        SELECT
+          poi_id,
+          image_url,
+          ROW_NUMBER() OVER (PARTITION BY poi_id ORDER BY sort_order ASC, id ASC) AS rn
+        FROM poi_photos
+        WHERE poi_id IN (?)
+      ) t
+      WHERE rn <= ?
+      ORDER BY poi_id ASC, rn ASC
+    `,
+    [ids, Math.max(1, Math.min(limitPerPoi, 12))]
+  );
+  const map = new Map();
+  rows.forEach((row) => {
+    const poiId = Number(row.poi_id);
+    if (!map.has(poiId)) map.set(poiId, []);
+    map.get(poiId).push(row.image_url);
   });
   return map;
 }
@@ -232,9 +301,10 @@ router.get("/", async (req, res) => {
         : "p.created_at DESC";
 
     const [rows] = await pool.query(
-      `SELECT p.*, u.nickname, u.avatar_url
+      `SELECT ${POST_SELECT_FIELDS}
        FROM posts p
        LEFT JOIN users u ON p.user_id = u.id
+       LEFT JOIN poi ON p.poi_id = poi.id
        WHERE ${where}
        ORDER BY ${orderBy}
        LIMIT ? OFFSET ?`,
@@ -243,8 +313,10 @@ router.get("/", async (req, res) => {
     const ids = rows.map((r) => r.id);
     const imagesMap = await fetchImages(ids);
     const tagsMap = await fetchTags(ids);
+    const poiIds = rows.map((r) => r.poi_id).filter(Boolean);
+    const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
 
-    const data = rows.map((r) => normalize(r, imagesMap, tagsMap));
+    const data = rows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
     res.json({ success: true, data });
   } catch (err) {
     console.error("list posts error", err);
@@ -267,14 +339,18 @@ router.get("/:id", async (req, res) => {
       );
     }
     const [[row]] = await pool.query(
-      `SELECT p.*, u.nickname, u.avatar_url
-       FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ? LIMIT 1`,
+      `SELECT ${POST_SELECT_FIELDS}
+       FROM posts p
+       LEFT JOIN users u ON p.user_id = u.id
+       LEFT JOIN poi ON p.poi_id = poi.id
+       WHERE p.id = ? LIMIT 1`,
       [id]
     );
     if (!row) return res.status(404).json({ success: false, message: "not found" });
     const imagesMap = await fetchImages([id]);
     const tagsMap = await fetchTags([id]);
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap) });
+    const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap) });
   } catch (err) {
     console.error("get post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -339,12 +415,17 @@ router.post("/", async (req, res) => {
     }
 
     const [[row]] = await pool.query(
-      `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
+      `SELECT ${POST_SELECT_FIELDS}
+       FROM posts p
+       LEFT JOIN users u ON p.user_id = u.id
+       LEFT JOIN poi ON p.poi_id = poi.id
+       WHERE p.id = ?`,
       [postId]
     );
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap) });
+    const poiPhotosMap = await fetchPoiPhotosByIds([row?.poi_id], 6);
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap) });
   } catch (err) {
     console.error("create post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -370,12 +451,17 @@ router.post("/:id/like", async (req, res) => {
       liked = true;
     }
     const [[row]] = await pool.query(
-      `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
+      `SELECT ${POST_SELECT_FIELDS}
+       FROM posts p
+       LEFT JOIN users u ON p.user_id = u.id
+       LEFT JOIN poi ON p.poi_id = poi.id
+       WHERE p.id = ?`,
       [postId]
     );
     if (!row) return res.status(404).json({ success: false, message: "not found" });
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
+    const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
     if (liked && row.user_id && row.user_id !== userId) {
       const actor = await fetchUserProfile(userId);
       pushNotification(row.user_id, {
@@ -387,7 +473,7 @@ router.post("/:id/like", async (req, res) => {
         title: row.title,
       });
     }
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap), liked: !existing });
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap), liked: !existing });
   } catch (err) {
     console.error("like post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -416,11 +502,16 @@ router.post("/:id/favorite", async (req, res) => {
       favored = true;
     }
     const [[row]] = await pool.query(
-      `SELECT p.*, u.nickname, u.avatar_url FROM posts p LEFT JOIN users u ON p.user_id = u.id WHERE p.id = ?`,
+      `SELECT ${POST_SELECT_FIELDS}
+       FROM posts p
+       LEFT JOIN users u ON p.user_id = u.id
+       LEFT JOIN poi ON p.poi_id = poi.id
+       WHERE p.id = ?`,
       [postId]
     );
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
+    const poiPhotosMap = await fetchPoiPhotosByIds([row?.poi_id], 6);
     if (favored && row.user_id && row.user_id !== userId) {
       const actor = await fetchUserProfile(userId);
       pushNotification(row.user_id, {
@@ -432,7 +523,7 @@ router.post("/:id/favorite", async (req, res) => {
         title: row.title,
       });
     }
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap), favorited: !existing });
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap), favorited: !existing });
   } catch (err) {
     console.error("fav post error", err);
     res.status(500).json({ success: false, message: "server error" });

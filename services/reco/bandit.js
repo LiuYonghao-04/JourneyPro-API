@@ -162,6 +162,14 @@ export const applyBanditBonus = async ({
     };
   });
 
+  const heuristicExplore = (candidate) => {
+    const novelty = Number(candidate.novelty_fit) || 0;
+    const coverage = Number(candidate.coverage_fit) || 0;
+    const quality = Number(candidate.quality_fit) || 0;
+    const interest = Number(candidate.interest_fit) || 0;
+    return clamp(novelty * 0.58 + coverage * 0.22 + quality * 0.1 + interest * 0.1, 0, 1);
+  };
+
   const categoryGroups = [...new Set(ranked.map((item) => item.arm_category_group))];
   const historyMap = await fetchArmHistory(mode, categoryGroups);
 
@@ -188,13 +196,16 @@ export const applyBanditBonus = async ({
       candidates: ranked.map((candidate) => ({
         ...candidate,
         bandit_raw: 0,
-        bandit_norm: 0,
-        bandit_bonus: 0,
-        final_pre_diversity: candidate.base_score,
+        bandit_norm: round(heuristicExplore(candidate), 6),
+        bandit_bonus: round(heuristicExplore(candidate) - (Number(candidate.base_score) || 0), 6),
+        final_pre_diversity: round(
+          (1 - exploreWeight) * (Number(candidate.base_score) || 0) + exploreWeight * heuristicExplore(candidate),
+          6
+        ),
       })),
       diagnostics: {
-        enabled: false,
-        reason: "insufficient_arm_history",
+        enabled: true,
+        reason: "heuristic_fallback_insufficient_arm_history",
         arms: Object.fromEntries(
           [...armStates.entries()].map(([armKey, state]) => [armKey, {
             impressions: state.impressions,
@@ -214,7 +225,8 @@ export const applyBanditBonus = async ({
   const normalizedScores = minMaxNormalize(rawScores, 0.5);
 
   const blended = ranked.map((candidate, index) => {
-    const banditNorm = normalizedScores[index];
+    const proxy = heuristicExplore(candidate);
+    const banditNorm = clamp(normalizedScores[index] * 0.8 + proxy * 0.2, 0, 1);
     const base = Number(candidate.base_score) || 0;
     const finalPreDiversity = (1 - exploreWeight) * base + exploreWeight * banditNorm;
     return {
