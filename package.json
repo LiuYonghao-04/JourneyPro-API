@@ -13,7 +13,11 @@
     "poi:expand": "node scripts/poi_expand_details.js",
     "poi:real-images": "node scripts/poi_real_images.js",
     "poi:real-images:baidu": "node scripts/poi_real_images_baidu.js",
-    "posts:reset-real-en": "node scripts/reset_posts_real_en.js"
+    "poi:fill-galleries": "node scripts/poi_fill_galleries.js",
+    "poi:fill-galleries:backfill": "node scripts/poi_gallery_backfill_from_category.js",
+    "images:repair": "node scripts/repair_image_urls.js",
+    "posts:reset-real-en": "node scripts/reset_posts_real_en.js",
+    "posts:seed-conversations-en": "node scripts/seed_posts_conversations_en.js"
   },
   "keywords": [],
   "author": "",
