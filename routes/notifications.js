@@ -86,7 +86,130 @@ async function ensureTables() {
       CONSTRAINT chk_follows_not_self CHECK (follower_id <> following_id)
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_notification_state (
+      user_id BIGINT PRIMARY KEY,
+      read_all_at DATETIME NULL,
+      read_like_at DATETIME NULL,
+      read_favorite_at DATETIME NULL,
+      read_comment_at DATETIME NULL,
+      read_follow_at DATETIME NULL,
+      read_chat_at DATETIME NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    );
+  `);
 }
+
+const EMPTY_STATE = {
+  read_all_at: null,
+  read_like_at: null,
+  read_favorite_at: null,
+  read_comment_at: null,
+  read_follow_at: null,
+  read_chat_at: null,
+};
+
+const mapState = (row) => ({
+  read_all_at: row?.read_all_at || null,
+  read_like_at: row?.read_like_at || null,
+  read_favorite_at: row?.read_favorite_at || null,
+  read_comment_at: row?.read_comment_at || null,
+  read_follow_at: row?.read_follow_at || null,
+  read_chat_at: row?.read_chat_at || null,
+});
+
+async function fetchNotificationState(userId) {
+  const [[row]] = await pool.query(
+    `SELECT read_all_at, read_like_at, read_favorite_at, read_comment_at, read_follow_at, read_chat_at
+     FROM user_notification_state WHERE user_id = ? LIMIT 1`,
+    [userId]
+  );
+  return row ? mapState(row) : { ...EMPTY_STATE };
+}
+
+function isUnread(item, state) {
+  const type = String(item?.type || "");
+  const createdAt = item?.created_at ? new Date(item.created_at).getTime() : 0;
+  const allReadAt = state?.read_all_at ? new Date(state.read_all_at).getTime() : 0;
+  if (allReadAt && createdAt <= allReadAt) return false;
+  const perTypeKey = `read_${type}_at`;
+  const typeReadAt = state?.[perTypeKey] ? new Date(state[perTypeKey]).getTime() : 0;
+  if (typeReadAt && createdAt <= typeReadAt) return false;
+  return true;
+}
+
+// GET /api/notifications/state?user_id=1
+router.get("/state", async (req, res) => {
+  try {
+    await ensureTables();
+    const userId = parseInt(req.query.user_id || "0", 10);
+    if (!userId) return res.json({ success: true, state: { ...EMPTY_STATE } });
+    const state = await fetchNotificationState(userId);
+    res.json({ success: true, state });
+  } catch (err) {
+    console.error("notification state error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+// POST /api/notifications/read { user_id, type }
+router.post("/read", async (req, res) => {
+  try {
+    await ensureTables();
+    const userId = parseInt(req.body?.user_id || "0", 10);
+    const type = String(req.body?.type || "all").toLowerCase();
+    const ts = req.body?.ts ? new Date(req.body.ts) : new Date();
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "user_id required" });
+    }
+    if (Number.isNaN(ts.getTime())) {
+      return res.status(400).json({ success: false, message: "invalid ts" });
+    }
+    const when = ts.toISOString().slice(0, 19).replace("T", " ");
+
+    if (type === "all") {
+      await pool.query(
+        `INSERT INTO user_notification_state
+         (user_id, read_all_at, read_like_at, read_favorite_at, read_comment_at, read_follow_at, read_chat_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           read_all_at = VALUES(read_all_at),
+           read_like_at = VALUES(read_like_at),
+           read_favorite_at = VALUES(read_favorite_at),
+           read_comment_at = VALUES(read_comment_at),
+           read_follow_at = VALUES(read_follow_at),
+           read_chat_at = VALUES(read_chat_at)`,
+        [userId, when, when, when, when, when, when]
+      );
+      const state = await fetchNotificationState(userId);
+      return res.json({ success: true, state });
+    }
+
+    const map = {
+      like: "read_like_at",
+      favorite: "read_favorite_at",
+      comment: "read_comment_at",
+      follow: "read_follow_at",
+      chat: "read_chat_at",
+    };
+    const col = map[type];
+    if (!col) {
+      return res.status(400).json({ success: false, message: "invalid type" });
+    }
+
+    await pool.query(
+      `INSERT INTO user_notification_state (user_id, ${col})
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE ${col} = VALUES(${col})`,
+      [userId, when]
+    );
+    const state = await fetchNotificationState(userId);
+    res.json({ success: true, state });
+  } catch (err) {
+    console.error("mark notification read error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
 
 // GET /api/notifications?user_id=1
 router.get("/", async (req, res) => {
@@ -131,7 +254,12 @@ router.get("/", async (req, res) => {
       [userId, userId, userId, userId, userId, userId, userId]
     );
 
-    res.json({ success: true, data: rows });
+    const state = await fetchNotificationState(userId);
+    const data = (rows || []).map((item) => ({
+      ...item,
+      unread: isUnread(item, state),
+    }));
+    res.json({ success: true, data, state });
   } catch (err) {
     console.error("notifications error", err);
     res.status(500).json({ success: false, message: "server error" });
