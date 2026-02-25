@@ -16,6 +16,42 @@ const POST_SELECT_FIELDS = `
   poi.address AS poi_address,
   poi.city AS poi_city
 `;
+const POST_FEED_SELECT_FIELDS = `
+  p.id,
+  p.user_id,
+  p.poi_id,
+  p.title,
+  LEFT(p.content, 360) AS content,
+  p.cover_image,
+  p.like_count,
+  p.favorite_count,
+  p.view_count,
+  p.created_at,
+  u.nickname,
+  u.avatar_url,
+  poi.name AS poi_name,
+  poi.category AS poi_category,
+  poi.lat AS poi_lat,
+  poi.lng AS poi_lng,
+  poi.image_url AS poi_image_url
+`;
+const POST_FEED_LITE_SELECT_FIELDS = `
+  p.id,
+  p.user_id,
+  p.poi_id,
+  p.title,
+  LEFT(p.content, 180) AS content,
+  p.cover_image,
+  p.like_count,
+  p.favorite_count,
+  p.view_count,
+  p.created_at,
+  u.nickname,
+  u.avatar_url,
+  poi.name AS poi_name,
+  poi.lat AS poi_lat,
+  poi.lng AS poi_lng
+`;
 
 async function tryAlter(sql) {
   try {
@@ -151,6 +187,23 @@ async function ensureTables() {
   await tryAlter(`ALTER TABLE posts MODIFY poi_id BIGINT NULL DEFAULT NULL`);
   await tryAlter(`ALTER TABLE posts MODIFY cover_image VARCHAR(600) NULL`);
   await tryAlter(`ALTER TABLE post_images MODIFY image_url VARCHAR(600) NOT NULL`);
+  await tryAlter(`ALTER TABLE post_images ADD INDEX idx_post_images_post_sort (post_id, sort_order, id)`);
+  await tryAlter(`ALTER TABLE post_tags ADD INDEX idx_post_tags_tag_post (tag_id, post_id)`);
+  await tryAlter(`ALTER TABLE posts ADD INDEX idx_posts_status_created (status, created_at, id)`);
+  await tryAlter(
+    `ALTER TABLE posts ADD INDEX idx_posts_status_hot (status, view_count, like_count, favorite_count, created_at, id)`
+  );
+}
+
+let ensureTablesPromise = null;
+function ensureTablesReady() {
+  if (!ensureTablesPromise) {
+    ensureTablesPromise = ensureTables().catch((err) => {
+      ensureTablesPromise = null;
+      throw err;
+    });
+  }
+  return ensureTablesPromise;
 }
 
 const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = {}) => ({
@@ -188,6 +241,39 @@ const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = 
     },
 });
 
+const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}) => {
+  const primaryImage = row.cover_image || primaryImageMap.get(row.id) || "";
+  return {
+    id: row.id,
+    poi_id: row.poi_id,
+    title: row.title,
+    content: String(row.content || ""),
+    cover_image: primaryImage || null,
+    images: primaryImage ? [primaryImage] : [],
+    tags: tagsMap.get(row.id) || [],
+    like_count: row.like_count || 0,
+    favorite_count: row.favorite_count || 0,
+    view_count: row.view_count || 0,
+    created_at: row.created_at,
+    poi: row.poi_id
+      ? {
+          id: row.poi_id,
+          name: row.poi_name || null,
+          category: row.poi_category || null,
+          lat: Number.isFinite(Number(row.poi_lat)) ? Number(row.poi_lat) : null,
+          lng: Number.isFinite(Number(row.poi_lng)) ? Number(row.poi_lng) : null,
+          image_url: row.poi_image_url || null,
+        }
+      : null,
+    user:
+      userMap[row.id] || {
+        id: row.user_id,
+        nickname: row.nickname || "鏃呬汉",
+        avatar_url: row.avatar_url || null,
+      },
+  };
+};
+
 async function fetchUserProfile(userId) {
   const [[u]] = await pool.query(`SELECT id, nickname, avatar_url FROM users WHERE id = ? LIMIT 1`, [userId]);
   return u || { id: userId, nickname: "旅人", avatar_url: null };
@@ -203,6 +289,30 @@ async function fetchImages(postIds) {
   rows.forEach((r) => {
     if (!map.has(r.post_id)) map.set(r.post_id, []);
     map.get(r.post_id).push(r.image_url);
+  });
+  return map;
+}
+
+async function fetchPrimaryImages(postIds) {
+  if (postIds.length === 0) return new Map();
+  const [rows] = await pool.query(
+    `
+      SELECT post_id, image_url
+      FROM (
+        SELECT
+          post_id,
+          image_url,
+          ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY sort_order ASC, id ASC) AS rn
+        FROM post_images
+        WHERE post_id IN (?)
+      ) t
+      WHERE rn = 1
+    `,
+    [postIds]
+  );
+  const map = new Map();
+  rows.forEach((row) => {
+    map.set(row.post_id, row.image_url);
   });
   return map;
 }
@@ -267,10 +377,12 @@ async function upsertTags(tagNames) {
 
 router.get("/", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const limit = Math.min(parseInt(req.query.limit || "30", 10), 50);
     const offset = parseInt(req.query.offset || "0", 10);
     const sort = req.query.sort === "hot" ? "hot" : "latest";
+    const compact = req.query.compact === "1";
+    const lite = compact && req.query.lite === "1";
     const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
     const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
@@ -306,8 +418,13 @@ router.get("/", async (req, res) => {
         ? "p.view_count DESC, p.like_count DESC, p.favorite_count DESC, p.created_at DESC"
         : "p.created_at DESC";
 
+    const selectFields = compact
+      ? lite
+        ? POST_FEED_LITE_SELECT_FIELDS
+        : POST_FEED_SELECT_FIELDS
+      : POST_SELECT_FIELDS;
     const [rows] = await pool.query(
-      `SELECT ${POST_SELECT_FIELDS}
+      `SELECT ${selectFields}
        FROM posts p
        LEFT JOIN users u ON p.user_id = u.id
        LEFT JOIN poi ON p.poi_id = poi.id
@@ -317,12 +434,18 @@ router.get("/", async (req, res) => {
       [...params, limit, offset]
     );
     const ids = rows.map((r) => r.id);
-    const imagesMap = await fetchImages(ids);
-    const tagsMap = await fetchTags(ids);
-    const poiIds = rows.map((r) => r.poi_id).filter(Boolean);
-    const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
-
-    const data = rows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
+    const tagsMap = lite ? new Map() : await fetchTags(ids);
+    let data = [];
+    if (compact) {
+      const needsPrimaryLookup = rows.some((row) => !row.cover_image);
+      const primaryImageMap = needsPrimaryLookup ? await fetchPrimaryImages(ids) : new Map();
+      data = rows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
+    } else {
+      const imagesMap = await fetchImages(ids);
+      const poiIds = rows.map((r) => r.poi_id).filter(Boolean);
+      const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
+      data = rows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
+    }
     res.json({ success: true, data });
   } catch (err) {
     console.error("list posts error", err);
@@ -330,9 +453,32 @@ router.get("/", async (req, res) => {
   }
 });
 
+router.get("/reactions/summary", async (req, res) => {
+  try {
+    await ensureTablesReady();
+    const userId = Number.parseInt(String(req.query.user_id || ""), 10);
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.json({ success: true, data: { liked_ids: [], favorited_ids: [] } });
+    }
+    const limit = Math.max(20, Math.min(Number.parseInt(String(req.query.limit || "500"), 10) || 500, 5000));
+    const [likedRows, favoritedRows] = await Promise.all([
+      pool.query(`SELECT post_id FROM post_likes WHERE user_id = ? ORDER BY id DESC LIMIT ?`, [userId, limit]),
+      pool.query(`SELECT post_id FROM post_favorites WHERE user_id = ? ORDER BY id DESC LIMIT ?`, [userId, limit]),
+    ]);
+    const likedIds = likedRows[0].map((row) => Number(row.post_id)).filter((id) => Number.isFinite(id) && id > 0);
+    const favoritedIds = favoritedRows[0]
+      .map((row) => Number(row.post_id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+    res.json({ success: true, data: { liked_ids: likedIds, favorited_ids: favoritedIds } });
+  } catch (err) {
+    console.error("reactions summary error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const id = parseInt(req.params.id, 10);
     const viewerId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     await pool.query(`UPDATE posts SET view_count = view_count + 1 WHERE id = ?`, [id]);
@@ -365,7 +511,7 @@ router.get("/:id", async (req, res) => {
 
 router.post("/", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const {
       user_id,
       poi_id,
@@ -440,7 +586,7 @@ router.post("/", async (req, res) => {
 
 router.post("/:id/like", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const postId = parseInt(req.params.id, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
     const [[existing]] = await pool.query(
@@ -488,7 +634,7 @@ router.post("/:id/like", async (req, res) => {
 
 router.post("/:id/favorite", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const postId = parseInt(req.params.id, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
     const [[existing]] = await pool.query(
@@ -539,7 +685,7 @@ router.post("/:id/favorite", async (req, res) => {
 // 获取标签列表
 router.get("/tags/list", async (_req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const [rows] = await pool.query(`SELECT id, name, type FROM tags ORDER BY id DESC LIMIT 50`);
     res.json({ success: true, data: rows });
   } catch (err) {
@@ -551,7 +697,7 @@ router.get("/tags/list", async (_req, res) => {
 // 获取评论列表（含一级+二级）
 router.get("/:id/comments", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const postId = parseInt(req.params.id, 10);
     const viewerId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const [rows] = await pool.query(
@@ -598,7 +744,7 @@ router.get("/:id/comments", async (req, res) => {
 // 新增评论 / 追评
 router.post("/:id/comments", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const postId = parseInt(req.params.id, 10);
     const { content, parent_id, parent_comment_id, user_id } = req.body || {};
     if (!content) return res.status(400).json({ success: false, message: "content required" });
@@ -652,7 +798,7 @@ router.post("/:id/comments", async (req, res) => {
 // 评论点赞/取消
 router.post("/comments/:cid/like", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const cid = parseInt(req.params.cid, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
     const [[existing]] = await pool.query(
