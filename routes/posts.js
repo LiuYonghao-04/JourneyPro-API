@@ -271,6 +271,7 @@ router.get("/", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "30", 10), 50);
     const offset = parseInt(req.query.offset || "0", 10);
     const sort = req.query.sort === "hot" ? "hot" : "latest";
+    const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
     const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
     const favoritedBy = req.query.favorited_by ? parseInt(req.query.favorited_by, 10) : null;
@@ -293,6 +294,11 @@ router.get("/", async (req, res) => {
     if (poiId) {
       where += " AND p.poi_id = ?";
       params.push(poiId);
+    }
+    if (tag) {
+      where +=
+        " AND EXISTS (SELECT 1 FROM post_tags pt JOIN tags t ON pt.tag_id = t.id WHERE pt.post_id = p.id AND t.name = ?)";
+      params.push(tag);
     }
 
     const orderBy =
