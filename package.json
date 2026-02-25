@@ -18,7 +18,9 @@
     "images:repair": "node scripts/repair_image_urls.js",
     "posts:reset-real-en": "node scripts/reset_posts_real_en.js",
     "posts:seed-conversations-en": "node scripts/seed_posts_conversations_en.js",
-    "posts:comments:backfill-tiered": "node scripts/post_comments_backfill_tiered.js"
+    "posts:comments:backfill-tiered": "node scripts/post_comments_backfill_tiered.js",
+    "social:seed": "node scripts/seed_social_interactions.js",
+    "notifications:backfill-owner": "node scripts/backfill_notification_owner_ids.js"
   },
   "keywords": [],
   "author": "",

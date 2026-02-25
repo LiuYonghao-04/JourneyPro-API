@@ -114,6 +114,7 @@ async function ensureTables() {
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
       user_id BIGINT NOT NULL,
+      post_owner_id BIGINT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uk_post_user_like (post_id, user_id)
     );
@@ -123,6 +124,7 @@ async function ensureTables() {
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
       user_id BIGINT NOT NULL,
+      post_owner_id BIGINT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uk_post_user_fav (post_id, user_id)
     );
@@ -157,6 +159,7 @@ async function ensureTables() {
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
       user_id BIGINT NOT NULL,
+      post_owner_id BIGINT NULL,
       parent_comment_id BIGINT NULL,
       type VARCHAR(20) DEFAULT 'COMMENT',
       content TEXT NOT NULL,
@@ -184,11 +187,17 @@ async function ensureTables() {
   await tryAlter(
     `ALTER TABLE post_comments ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
   );
+  await tryAlter(`ALTER TABLE post_likes ADD COLUMN post_owner_id BIGINT NULL`);
+  await tryAlter(`ALTER TABLE post_favorites ADD COLUMN post_owner_id BIGINT NULL`);
+  await tryAlter(`ALTER TABLE post_comments ADD COLUMN post_owner_id BIGINT NULL`);
   await tryAlter(`ALTER TABLE posts MODIFY poi_id BIGINT NULL DEFAULT NULL`);
   await tryAlter(`ALTER TABLE posts MODIFY cover_image VARCHAR(600) NULL`);
   await tryAlter(`ALTER TABLE post_images MODIFY image_url VARCHAR(600) NOT NULL`);
   await tryAlter(`ALTER TABLE post_images ADD INDEX idx_post_images_post_sort (post_id, sort_order, id)`);
   await tryAlter(`ALTER TABLE post_tags ADD INDEX idx_post_tags_tag_post (tag_id, post_id)`);
+  await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
+  await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_fav_owner_created (post_owner_id, created_at, post_id, user_id)`);
+  await tryAlter(`ALTER TABLE post_comments ADD INDEX idx_post_comments_owner_created (post_owner_id, created_at, post_id, user_id)`);
   await tryAlter(`ALTER TABLE posts ADD INDEX idx_posts_status_created (status, created_at, id)`);
   await tryAlter(
     `ALTER TABLE posts ADD INDEX idx_posts_status_hot (status, view_count, like_count, favorite_count, created_at, id)`
@@ -598,7 +607,16 @@ router.post("/:id/like", async (req, res) => {
       await pool.query(`DELETE FROM post_likes WHERE id = ?`, [existing.id]);
       await pool.query(`UPDATE posts SET like_count = GREATEST(like_count - 1, 0) WHERE id = ?`, [postId]);
     } else {
-      await pool.query(`INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
+      await pool.query(
+        `
+          INSERT INTO post_likes (post_id, user_id, post_owner_id)
+          SELECT ?, ?, p.user_id
+          FROM posts p
+          WHERE p.id = ?
+          LIMIT 1
+        `,
+        [postId, userId, postId]
+      );
       await pool.query(`UPDATE posts SET like_count = like_count + 1 WHERE id = ?`, [postId]);
       liked = true;
     }
@@ -649,7 +667,16 @@ router.post("/:id/favorite", async (req, res) => {
         [postId]
       );
     } else {
-      await pool.query(`INSERT INTO post_favorites (post_id, user_id) VALUES (?, ?)`, [postId, userId]);
+      await pool.query(
+        `
+          INSERT INTO post_favorites (post_id, user_id, post_owner_id)
+          SELECT ?, ?, p.user_id
+          FROM posts p
+          WHERE p.id = ?
+          LIMIT 1
+        `,
+        [postId, userId, postId]
+      );
       await pool.query(`UPDATE posts SET favorite_count = favorite_count + 1 WHERE id = ?`, [postId]);
       favored = true;
     }
@@ -752,9 +779,18 @@ router.post("/:id/comments", async (req, res) => {
     const parentId = parent_comment_id || parent_id || null;
     const type = parentId ? "REPLY" : "COMMENT";
     const [r] = await pool.query(
-      `INSERT INTO post_comments (post_id, user_id, parent_comment_id, type, content) VALUES (?, ?, ?, ?, ?)`,
-      [postId, uid, parentId, type, content]
+      `
+        INSERT INTO post_comments (post_id, user_id, post_owner_id, parent_comment_id, type, content)
+        SELECT ?, ?, p.user_id, ?, ?, ?
+        FROM posts p
+        WHERE p.id = ?
+        LIMIT 1
+      `,
+      [postId, uid, parentId, type, content, postId]
     );
+    if (!r?.insertId) {
+      return res.status(404).json({ success: false, message: "post not found" });
+    }
     const commentId = r.insertId;
     const [[postRow]] = await pool.query(`SELECT user_id, title FROM posts WHERE id = ? LIMIT 1`, [postId]);
     if (postRow?.user_id && postRow.user_id !== uid) {
