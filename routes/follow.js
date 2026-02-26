@@ -33,11 +33,9 @@ async function ensureFollowTable() {
       CONSTRAINT chk_follows_not_self CHECK (follower_id <> following_id)
     );
   `);
-  await createIndexSafe(`CREATE INDEX idx_follows_follower ON user_follows(follower_id)`, "idx_follows_follower");
-  await createIndexSafe(`CREATE INDEX idx_follows_following ON user_follows(following_id)`, "idx_follows_following");
   await createIndexSafe(
-    `CREATE INDEX idx_follows_following_created ON user_follows(following_id, created_at, follower_id)`,
-    "idx_follows_following_created"
+    `CREATE INDEX idx_user_follows_following_created ON user_follows(following_id, created_at, follower_id)`,
+    "idx_user_follows_following_created"
   );
   await createIndexSafe(
     `CREATE INDEX idx_follows_follower_created ON user_follows(follower_id, created_at, following_id)`,

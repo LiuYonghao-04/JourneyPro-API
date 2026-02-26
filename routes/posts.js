@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import { pool } from "../db/connect.js";
 import { pushNotification } from "./notifications.js";
 
@@ -51,6 +51,20 @@ const POST_FEED_LITE_SELECT_FIELDS = `
   poi.name AS poi_name,
   poi.lat AS poi_lat,
   poi.lng AS poi_lng
+`;
+const COMMENT_UNION_COLUMNS = `
+  id,
+  post_id,
+  user_id,
+  post_owner_id,
+  parent_comment_id,
+  type,
+  content,
+  like_count,
+  reply_count,
+  status,
+  created_at,
+  updated_at
 `;
 
 async function tryAlter(sql) {
@@ -171,6 +185,28 @@ async function ensureTables() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_comments_archive (
+      id BIGINT PRIMARY KEY,
+      post_id BIGINT NOT NULL,
+      user_id BIGINT NOT NULL,
+      post_owner_id BIGINT NULL,
+      parent_comment_id BIGINT NULL,
+      type VARCHAR(20) DEFAULT 'COMMENT',
+      content TEXT NOT NULL,
+      like_count INT DEFAULT 0,
+      reply_count INT DEFAULT 0,
+      status VARCHAR(20) DEFAULT 'NORMAL',
+      created_at TIMESTAMP NULL,
+      updated_at TIMESTAMP NULL,
+      archive_batch_id BIGINT NULL,
+      archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_post_comments_archive_post_created (post_id, created_at, id),
+      INDEX idx_post_comments_archive_parent (parent_comment_id),
+      INDEX idx_post_comments_archive_owner_created (post_owner_id, created_at, post_id, user_id),
+      INDEX idx_post_comments_archive_batch (archive_batch_id, id)
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS comment_likes (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       comment_id BIGINT NOT NULL,
@@ -187,6 +223,14 @@ async function ensureTables() {
   await tryAlter(
     `ALTER TABLE post_comments ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
   );
+  await tryAlter(`ALTER TABLE post_comments_archive ADD COLUMN archive_batch_id BIGINT NULL`);
+  await tryAlter(`ALTER TABLE post_comments_archive ADD COLUMN archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+  await tryAlter(`ALTER TABLE post_comments_archive ADD INDEX idx_post_comments_archive_post_created (post_id, created_at, id)`);
+  await tryAlter(`ALTER TABLE post_comments_archive ADD INDEX idx_post_comments_archive_parent (parent_comment_id)`);
+  await tryAlter(
+    `ALTER TABLE post_comments_archive ADD INDEX idx_post_comments_archive_owner_created (post_owner_id, created_at, post_id, user_id)`
+  );
+  await tryAlter(`ALTER TABLE post_comments_archive ADD INDEX idx_post_comments_archive_batch (archive_batch_id, id)`);
   await tryAlter(`ALTER TABLE post_likes ADD COLUMN post_owner_id BIGINT NULL`);
   await tryAlter(`ALTER TABLE post_favorites ADD COLUMN post_owner_id BIGINT NULL`);
   await tryAlter(`ALTER TABLE post_comments ADD COLUMN post_owner_id BIGINT NULL`);
@@ -196,7 +240,9 @@ async function ensureTables() {
   await tryAlter(`ALTER TABLE post_images ADD INDEX idx_post_images_post_sort (post_id, sort_order, id)`);
   await tryAlter(`ALTER TABLE post_tags ADD INDEX idx_post_tags_tag_post (tag_id, post_id)`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
-  await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_fav_owner_created (post_owner_id, created_at, post_id, user_id)`);
+  await tryAlter(
+    `ALTER TABLE post_favorites ADD INDEX idx_post_favorites_owner_created (post_owner_id, created_at, post_id, user_id)`
+  );
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_user_post (user_id, post_id)`);
   await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_favorites_user_post (user_id, post_id)`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_user_recent (user_id, id, post_id)`);
@@ -219,6 +265,63 @@ function ensureTablesReady() {
     });
   }
   return ensureTablesPromise;
+}
+
+async function bumpCommentCounter(commentId, field, delta) {
+  const column = field === "reply_count" ? "reply_count" : "like_count";
+  const step = Number(delta) >= 0 ? 1 : -1;
+  const expr = step > 0 ? `${column} = ${column} + 1` : `${column} = GREATEST(${column} - 1, 0)`;
+  const [hot] = await pool.query(`UPDATE post_comments SET ${expr} WHERE id = ?`, [commentId]);
+  if ((hot?.affectedRows || 0) > 0) return;
+  await pool.query(`UPDATE post_comments_archive SET ${expr} WHERE id = ?`, [commentId]);
+}
+
+async function fetchCommentWithUser(commentId) {
+  const [hotRows] = await pool.query(
+    `
+      SELECT c.*, u.nickname, u.avatar_url
+      FROM post_comments c
+      LEFT JOIN users u ON c.user_id = u.id
+      WHERE c.id = ?
+      LIMIT 1
+    `,
+    [commentId]
+  );
+  if (hotRows?.length) return hotRows[0];
+  const [archiveRows] = await pool.query(
+    `
+      SELECT c.*, u.nickname, u.avatar_url
+      FROM post_comments_archive c
+      LEFT JOIN users u ON c.user_id = u.id
+      WHERE c.id = ?
+      LIMIT 1
+    `,
+    [commentId]
+  );
+  return archiveRows?.[0] || null;
+}
+
+async function ensureCommentInHotTable(commentId) {
+  const [[hot]] = await pool.query(`SELECT id FROM post_comments WHERE id = ? LIMIT 1`, [commentId]);
+  if (hot?.id) return true;
+  const [insert] = await pool.query(
+    `
+      INSERT IGNORE INTO post_comments (
+        id, post_id, user_id, post_owner_id, parent_comment_id, type, content,
+        like_count, reply_count, status, created_at, updated_at
+      )
+      SELECT
+        id, post_id, user_id, post_owner_id, parent_comment_id, type, content,
+        like_count, reply_count, status, created_at, updated_at
+      FROM post_comments_archive
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [commentId]
+  );
+  if ((insert?.affectedRows || 0) > 0) return true;
+  const [[existsNow]] = await pool.query(`SELECT id FROM post_comments WHERE id = ? LIMIT 1`, [commentId]);
+  return !!existsNow?.id;
 }
 
 const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = {}) => ({
@@ -800,12 +903,18 @@ router.get("/:id/comments", async (req, res) => {
     const viewerId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const [rows] = await pool.query(
       `SELECT c.*, u.nickname, u.avatar_url, ${viewerId ? "IF(cl.id IS NULL, 0, 1)" : "0"} AS liked_by_user
-       FROM post_comments c
+       FROM (
+         SELECT ${COMMENT_UNION_COLUMNS} FROM post_comments WHERE post_id = ?
+         UNION ALL
+         SELECT ${COMMENT_UNION_COLUMNS}
+         FROM post_comments_archive a
+         WHERE a.post_id = ?
+           AND NOT EXISTS (SELECT 1 FROM post_comments h WHERE h.id = a.id)
+       ) c
        LEFT JOIN users u ON c.user_id = u.id
        ${viewerId ? "LEFT JOIN comment_likes cl ON cl.comment_id = c.id AND cl.user_id = ?" : ""}
-       WHERE c.post_id = ?
        ORDER BY c.created_at ASC`,
-      viewerId ? [viewerId, postId] : [postId]
+      viewerId ? [postId, postId, viewerId] : [postId, postId]
     );
     const map = new Map();
     rows.forEach((r) => {
@@ -849,6 +958,12 @@ router.post("/:id/comments", async (req, res) => {
     const uid = user_id || DEFAULT_USER_ID;
     const parentId = parent_comment_id || parent_id || null;
     const type = parentId ? "REPLY" : "COMMENT";
+    if (parentId) {
+      const parentReady = await ensureCommentInHotTable(parentId);
+      if (!parentReady) {
+        return res.status(400).json({ success: false, message: "parent comment not found" });
+      }
+    }
     const [r] = await pool.query(
       `
         INSERT INTO post_comments (post_id, user_id, post_owner_id, parent_comment_id, type, content)
@@ -877,13 +992,10 @@ router.post("/:id/comments", async (req, res) => {
       });
     }
     if (parentId) {
-      await pool.query(`UPDATE post_comments SET reply_count = reply_count + 1 WHERE id = ?`, [parentId]);
+      await bumpCommentCounter(parentId, "reply_count", 1);
     }
-    const [[row]] = await pool.query(
-      `SELECT c.*, u.nickname, u.avatar_url
-       FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
-      [commentId]
-    );
+    const row = await fetchCommentWithUser(commentId);
+    if (!row) return res.status(404).json({ success: false, message: "comment not found after insert" });
     const item = {
       id: row.id,
       post_id: row.post_id,
@@ -908,32 +1020,31 @@ router.post("/comments/:cid/like", async (req, res) => {
     await ensureTablesReady();
     const cid = parseInt(req.params.cid, 10);
     const userId = req.body?.user_id || DEFAULT_USER_ID;
+    const commentReady = await ensureCommentInHotTable(cid);
+    if (!commentReady) return res.status(404).json({ success: false, message: "comment not found" });
     const [[existing]] = await pool.query(
       `SELECT id FROM comment_likes WHERE comment_id = ? AND user_id = ? LIMIT 1`,
       [cid, userId]
     );
     if (existing) {
       await pool.query(`DELETE FROM comment_likes WHERE id = ?`, [existing.id]);
-      await pool.query(`UPDATE post_comments SET like_count = GREATEST(like_count - 1, 0) WHERE id = ?`, [cid]);
+      await bumpCommentCounter(cid, "like_count", -1);
     } else {
       await pool.query(`INSERT INTO comment_likes (comment_id, user_id) VALUES (?, ?)`, [cid, userId]);
-      await pool.query(`UPDATE post_comments SET like_count = like_count + 1 WHERE id = ?`, [cid]);
+      await bumpCommentCounter(cid, "like_count", 1);
     }
-  const [[row]] = await pool.query(
-    `SELECT c.*, u.nickname, u.avatar_url
-     FROM post_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?`,
-    [cid]
-  );
-  const data = {
-    id: row.id,
-    post_id: row.post_id,
-    user_id: row.user_id,
-    parent_id: row.parent_comment_id ?? row.parent_id,
-    content: row.content,
-    like_count: row.like_count || 0,
-    created_at: row.created_at,
-    user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
-  };
+    const row = await fetchCommentWithUser(cid);
+    if (!row) return res.status(404).json({ success: false, message: "comment not found" });
+    const data = {
+      id: row.id,
+      post_id: row.post_id,
+      user_id: row.user_id,
+      parent_id: row.parent_comment_id ?? row.parent_id,
+      content: row.content,
+      like_count: row.like_count || 0,
+      created_at: row.created_at,
+      user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+    };
     res.json({ success: true, data, liked: !existing });
   } catch (err) {
     console.error("like comment error", err);
