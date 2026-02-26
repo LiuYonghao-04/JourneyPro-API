@@ -12,6 +12,7 @@ JourneyPro API is the Node.js backend for the JourneyPro graduation project. It 
 - [Database notes](#database-notes)
 - [Data import scripts](#data-import-scripts)
 - [Maintenance scheduler](#maintenance-scheduler)
+- [Release hardening](#release-hardening)
 - [Security notes](#security-notes)
 
 ## Highlights
@@ -67,6 +68,11 @@ DB_PASS=123456
 DB_NAME=journeypro
 JWT_SECRET=replace-me
 OSRM_URL=http://localhost:5000
+OSRM_URLS=http://localhost:5000,https://router.project-osrm.org
+OSRM_ENABLE_PUBLIC_FALLBACK=1
+OSRM_LOCAL_TIMEOUT_MS=600
+OSRM_REMOTE_TIMEOUT_MS=12000
+OSRM_DOWN_COOLDOWN_MS=15000
 ```
 
 ### Run
@@ -89,7 +95,18 @@ Server will listen on `http://localhost:3001` by default.
 | `DB_NAME` | `journeypro` | Database name |
 | `DB_POOL_SIZE` | `10` | MySQL connection pool size |
 | `JWT_SECRET` | `journeypro-secret` | JWT signing secret |
-| `OSRM_URL` | `http://localhost:5000` | OSRM base URL (e.g. `http://127.0.0.1:5000`) |
+| `OSRM_URL` | `http://localhost:5000` | Single OSRM backend (legacy option, local preferred) |
+| `OSRM_URLS` | `http://localhost:5000,https://router.project-osrm.org` | Ordered OSRM backend list (local first, online fallback) |
+| `OSRM_ENABLE_PUBLIC_FALLBACK` | `1` | Auto-append `https://router.project-osrm.org` when missing |
+| `OSRM_LOCAL_TIMEOUT_MS` | `600` | Timeout for local/private OSRM backends |
+| `OSRM_REMOTE_TIMEOUT_MS` | `12000` | Timeout for public/remote OSRM backends |
+| `OSRM_DOWN_COOLDOWN_MS` | `15000` | Circuit-break cooldown after backend failure |
+| `ENABLE_RUNTIME_SCHEMA_MIGRATION` | `0` | `1` enables route-time DDL; keep `0` in release |
+| `SLOW_API_MS` | `800` | Slow API warning threshold |
+| `METRIC_SAMPLE_LIMIT` | `400` | In-memory latency sample count per endpoint |
+| `OPS_METRICS_TOKEN` | _(empty)_ | Optional token for `/api/ops/*` endpoints |
+| `BANDIT_HISTORY_CACHE_TTL_MS` | `120000` | In-memory cache TTL for bandit arm history |
+| `BANDIT_USE_EVENT_HISTORY` | `0` | `1` to query `recommendation_events` directly (slower on large tables) |
 
 ## API overview
 
@@ -141,7 +158,13 @@ Base path: `/api`
 ### Notifications
 
 - `GET /api/notifications?user_id=1`
+- `GET /api/notifications?user_id=1&before_ts=...&before_id=...` (older page cursor)
 - `GET /api/notifications/stream?user_id=1` (SSE)
+
+### Ops / observability
+
+- `GET /api/ops/health`
+- `GET /api/ops/metrics`
 
 ### Chat
 
@@ -239,6 +262,32 @@ Maintenance logs are written to:
 
 - `JourneyPro-api/logs/maintenance/comments_archive_hot_YYYYMMDD.log`
 - `JourneyPro-api/logs/maintenance/db_maintenance_daily_YYYYMMDD.log`
+
+## Release hardening
+
+### Backup first (no-downtime safe snapshot)
+
+```bash
+npm run db:backup:snapshot
+```
+
+This writes:
+
+- `backups/<timestamp>/manifest.json`
+- `backups/<timestamp>/schema.sql`
+- `backups/<timestamp>/*.ndjson` for critical tables
+
+### Pre-release gates
+
+```bash
+npm run release:check
+npm run loadtest:core -- --duration=30 --concurrency=8
+```
+
+### Runbooks
+
+- Backup runbook: `scripts/DB_BACKUP_RUNBOOK.md`
+- Go/No-Go checklist: `scripts/RELEASE_GONOGO_CHECKLIST.md`
 
 ## Security notes
 

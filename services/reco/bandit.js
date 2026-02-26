@@ -18,6 +18,12 @@ import {
 
 const ARM_DIM = 10;
 const ARM_MIN_IMPRESSIONS = 8;
+const BANDIT_HISTORY_CACHE_TTL_MS = Math.max(
+  10 * 1000,
+  Math.min(Number(process.env.BANDIT_HISTORY_CACHE_TTL_MS || 120000), 30 * 60 * 1000)
+);
+const BANDIT_USE_EVENT_HISTORY = process.env.BANDIT_USE_EVENT_HISTORY === "1";
+const armHistoryCache = new Map();
 
 const normalizeCategoryGroup = (category) => {
   const normalized = String(category || "unknown").trim().toLowerCase();
@@ -42,13 +48,24 @@ export const buildContextVector = (candidate, rankNorm, hour) => {
   ];
 };
 
-const fetchArmHistory = async (mode, categoryGroups) => {
+const buildInClause = (list) => list.map(() => "?").join(", ");
+
+const cloneHistoryMap = (map) => {
+  const cloned = new Map();
+  for (const [key, value] of map.entries()) {
+    cloned.set(key, { ...value });
+  }
+  return cloned;
+};
+
+const fetchArmHistoryFromEvents = async (mode, categoryGroups) => {
   if (!categoryGroups.length) return new Map();
 
   const rewardSql = Object.entries(EVENT_REWARD_WEIGHTS)
     .map(([eventType, weight]) => `WHEN '${eventType}' THEN ${Number(weight)}`)
     .join(" ");
 
+  const inClause = buildInClause(categoryGroups);
   const [rows] = await pool.query(
     `
       SELECT
@@ -60,19 +77,71 @@ const fetchArmHistory = async (mode, categoryGroups) => {
       LEFT JOIN poi p ON p.id = re.poi_id
       WHERE re.mode = ?
         AND re.ts >= DATE_SUB(NOW(), INTERVAL 90 DAY)
-        AND COALESCE(NULLIF(TRIM(LOWER(p.category)), ''), 'unknown') IN (?)
+        AND COALESCE(NULLIF(TRIM(LOWER(p.category)), ''), 'unknown') IN (${inClause})
       GROUP BY category_group
     `,
-    [mode, categoryGroups]
+    [mode, ...categoryGroups]
   );
 
   const map = new Map();
   rows.forEach((row) => {
-    map.set(String(row.category_group || "unknown"), {
-      rewardSum: Number(row.reward_sum) || 0,
-      impressions: Number(row.impressions) || 0,
-      totalEvents: Number(row.total_events) || 0,
+    map.set(String(row.category_group || row.CATEGORY_GROUP || "unknown"), {
+      rewardSum: Number(row.reward_sum ?? row.REWARD_SUM ?? 0) || 0,
+      impressions: Number(row.impressions ?? row.IMPRESSIONS ?? 0) || 0,
+      totalEvents: Number(row.total_events ?? row.TOTAL_EVENTS ?? 0) || 0,
     });
+  });
+  return map;
+};
+
+const fetchArmHistoryFromQualityStats = async (mode, categoryGroups) => {
+  if (!categoryGroups.length) return new Map();
+  const inClause = buildInClause(categoryGroups);
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        COALESCE(NULLIF(TRIM(LOWER(p.category)), ''), 'unknown') AS category_group,
+        SUM(COALESCE(q.interactions, 0) + COALESCE(q.add_via_count, 0) * 0.5 + COALESCE(q.save_count, 0) * 0.35) AS reward_sum,
+        SUM(COALESCE(q.impressions, 0)) AS impressions,
+        COUNT(*) AS total_events
+      FROM poi_quality_stats q
+      JOIN poi p ON p.id = q.poi_id
+      WHERE q.mode = ?
+        AND COALESCE(NULLIF(TRIM(LOWER(p.category)), ''), 'unknown') IN (${inClause})
+      GROUP BY category_group
+    `,
+    [mode, ...categoryGroups]
+  );
+
+  const map = new Map();
+  rows.forEach((row) => {
+    map.set(String(row.category_group || row.CATEGORY_GROUP || "unknown"), {
+      rewardSum: Number(row.reward_sum ?? row.REWARD_SUM ?? 0) || 0,
+      impressions: Number(row.impressions ?? row.IMPRESSIONS ?? 0) || 0,
+      totalEvents: Number(row.total_events ?? row.TOTAL_EVENTS ?? 0) || 0,
+    });
+  });
+  return map;
+};
+
+const fetchArmHistory = async (mode, categoryGroups) => {
+  if (!categoryGroups.length) return new Map();
+  const safeGroups = [...new Set(categoryGroups.map((g) => String(g || "unknown").trim().toLowerCase()).filter(Boolean))];
+  const cacheKey = `${mode}|${safeGroups.sort().join(",")}`;
+  const now = Date.now();
+  const cached = armHistoryCache.get(cacheKey);
+  if (cached && now - cached.ts <= BANDIT_HISTORY_CACHE_TTL_MS) {
+    return cloneHistoryMap(cached.map);
+  }
+
+  const map = BANDIT_USE_EVENT_HISTORY
+    ? await fetchArmHistoryFromEvents(mode, safeGroups)
+    : await fetchArmHistoryFromQualityStats(mode, safeGroups);
+
+  armHistoryCache.set(cacheKey, {
+    ts: now,
+    map: cloneHistoryMap(map),
   });
   return map;
 };

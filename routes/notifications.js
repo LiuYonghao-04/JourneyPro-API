@@ -32,6 +32,15 @@ async function tryAlter(sql) {
 }
 
 async function ensureTables() {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn(
+        "[notifications] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)"
+      );
+    }
+    return;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -369,6 +378,7 @@ router.get("/", async (req, res) => {
       : limit;
 
     let sinceSql = "";
+    let beforeSql = "";
     let sinceValue = 0;
     let sinceIdValue = 0;
     const sinceRaw = req.query.since_ts || req.query.since;
@@ -380,6 +390,19 @@ router.get("/", async (req, res) => {
         sinceIdValue = Number.isFinite(sinceIdParsed) && sinceIdParsed > 0 ? sinceIdParsed : 0;
         sinceSql =
           " AND (UNIX_TIMESTAMP(__CREATED_AT__) > ? OR (UNIX_TIMESTAMP(__CREATED_AT__) = ? AND COALESCE(__SOURCE_ID__, 0) > ?)) ";
+      }
+    }
+    let beforeValue = 0;
+    let beforeIdValue = 0;
+    const beforeRaw = req.query.before_ts || req.query.cursor_ts;
+    if (!sinceValue && beforeRaw) {
+      const d = new Date(String(beforeRaw));
+      if (!Number.isNaN(d.getTime())) {
+        beforeValue = Math.floor(d.getTime() / 1000);
+        const beforeIdParsed = parseInt(String(req.query.before_id || req.query.cursor_id || "0"), 10);
+        beforeIdValue = Number.isFinite(beforeIdParsed) && beforeIdParsed > 0 ? beforeIdParsed : 0;
+        beforeSql =
+          " AND (UNIX_TIMESTAMP(__CREATED_AT__) < ? OR (UNIX_TIMESTAMP(__CREATED_AT__) = ? AND COALESCE(__SOURCE_ID__, 0) < ?)) ";
       }
     }
 
@@ -395,6 +418,8 @@ router.get("/", async (req, res) => {
           FROM post_likes pl
           WHERE pl.post_owner_id = ? AND pl.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pl.created_at")
+            .replaceAll("__SOURCE_ID__", "pl.id")}${beforeSql
+            .replaceAll("__CREATED_AT__", "pl.created_at")
             .replaceAll("__SOURCE_ID__", "pl.id")}
           ORDER BY pl.created_at DESC, pl.id DESC
           LIMIT ${branchLimit}
@@ -402,6 +427,7 @@ router.get("/", async (req, res) => {
       `);
       params.push(userId, userId);
       if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
+      if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
     }
     if (include("favorite")) {
       pieces.push(`
@@ -411,6 +437,8 @@ router.get("/", async (req, res) => {
           FROM post_favorites pf
           WHERE pf.post_owner_id = ? AND pf.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pf.created_at")
+            .replaceAll("__SOURCE_ID__", "pf.id")}${beforeSql
+            .replaceAll("__CREATED_AT__", "pf.created_at")
             .replaceAll("__SOURCE_ID__", "pf.id")}
           ORDER BY pf.created_at DESC, pf.id DESC
           LIMIT ${branchLimit}
@@ -418,6 +446,7 @@ router.get("/", async (req, res) => {
       `);
       params.push(userId, userId);
       if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
+      if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
     }
     if (include("comment")) {
       pieces.push(`
@@ -427,6 +456,8 @@ router.get("/", async (req, res) => {
           FROM post_comments pc
           WHERE pc.post_owner_id = ? AND pc.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pc.created_at")
+            .replaceAll("__SOURCE_ID__", "pc.id")}${beforeSql
+            .replaceAll("__CREATED_AT__", "pc.created_at")
             .replaceAll("__SOURCE_ID__", "pc.id")}
           ORDER BY pc.created_at DESC, pc.id DESC
           LIMIT ${commentBranchLimit}
@@ -434,6 +465,7 @@ router.get("/", async (req, res) => {
       `);
       params.push(userId, userId);
       if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
+      if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
     }
     if (include("follow")) {
       pieces.push(`
@@ -443,6 +475,8 @@ router.get("/", async (req, res) => {
           FROM user_follows uf
           WHERE uf.following_id = ? ${sinceSql
             .replaceAll("__CREATED_AT__", "uf.created_at")
+            .replaceAll("__SOURCE_ID__", "uf.id")}${beforeSql
+            .replaceAll("__CREATED_AT__", "uf.created_at")
             .replaceAll("__SOURCE_ID__", "uf.id")}
           ORDER BY uf.created_at DESC, uf.id DESC
           LIMIT ${branchLimit}
@@ -450,6 +484,7 @@ router.get("/", async (req, res) => {
       `);
       params.push(userId);
       if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
+      if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
     }
 
     if (!pieces.length) {
@@ -481,8 +516,12 @@ router.get("/", async (req, res) => {
       LIMIT ?
     `;
 
-    const [rows] = await pool.query(query, [...params, unionScanLimit]);
-    const rankedRows = filterType === "all" ? rebalanceAllNotifications(rows || [], limit) : (rows || []).slice(0, limit);
+    const fetchLimit = Math.max(unionScanLimit, limit + 1);
+    const [rows] = await pool.query(query, [...params, fetchLimit]);
+    const rankedRowsRaw =
+      filterType === "all" ? rebalanceAllNotifications(rows || [], limit + 1) : (rows || []).slice(0, limit + 1);
+    const hasMore = rankedRowsRaw.length > limit;
+    const rankedRows = rankedRowsRaw.slice(0, limit);
 
     const state = await fetchNotificationState(userId);
     const data = rankedRows.map((item) => ({
@@ -495,12 +534,20 @@ router.get("/", async (req, res) => {
           id: Number(data[0]?.source_id || 0) || 0,
         }
       : null;
+    const nextCursor = data.length
+      ? {
+          ts: data[data.length - 1]?.created_at || null,
+          id: Number(data[data.length - 1]?.source_id || 0) || 0,
+        }
+      : null;
     res.json({
       success: true,
       data,
       state,
       cursor: latestCursor?.ts || null,
       latest_cursor: latestCursor,
+      next_cursor: nextCursor,
+      has_more: hasMore,
     });
   } catch (err) {
     console.error("notifications error", err);

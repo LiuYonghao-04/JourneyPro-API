@@ -1,5 +1,6 @@
 param(
-  [bool]$ApplyIndexFix = $true
+  [bool]$ApplyIndexFix = $true,
+  [bool]$SkipBackup = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,13 +47,16 @@ $exitCode = 0
 try {
   Push-Location $apiRoot
   Write-Log "Start daily DB maintenance."
-  Write-Log ("ApplyIndexFix=" + $ApplyIndexFix)
+  Write-Log ("ApplyIndexFix=" + $ApplyIndexFix + ", SkipBackup=" + $SkipBackup)
 
   $script:npmCmd = (Get-Command npm.cmd -ErrorAction SilentlyContinue).Source
   if ([string]::IsNullOrWhiteSpace($script:npmCmd)) {
     $script:npmCmd = "npm"
   }
 
+  if (-not $SkipBackup) {
+    Invoke-Step -Title "DB snapshot backup" -NpmArgs @("run", "db:backup:snapshot")
+  }
   Invoke-Step -Title "DB health check" -NpmArgs @("run", "db:health")
   Invoke-Step -Title "Index compaction dry-run" -NpmArgs @("run", "db:migrate:index-v2", "--", "--dry-run")
   if ($ApplyIndexFix) {

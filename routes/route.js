@@ -1,5 +1,4 @@
-﻿import express from "express";
-import axios from "axios";
+import express from "express";
 import {
   DEFAULT_CANDIDATE_LIMIT,
   DEFAULT_EXPLORE_WEIGHT,
@@ -12,13 +11,50 @@ import {
   parseBoolFlag,
 } from "../services/reco/constants.js";
 import { assignRecommendationBucket } from "../services/reco/ab.js";
+import { fetchOsrmRoute } from "../services/osrm/client.js";
 import { runRecommendationV2 } from "../services/reco/ranker.js";
 import { ensureRecoTables } from "../services/reco/schema.js";
 import { fetchUserRecommendationSettings } from "../services/reco/profiles.js";
 
 const router = express.Router();
 
-const OSRM_URL = process.env.OSRM_URL || "http://localhost:5000";
+const haversineMeters = (lat1, lng1, lat2, lng2) => {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+};
+
+const buildApproxRoute = (points, speedMps = 13.89) => {
+  const safePoints = (points || [])
+    .filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+    .map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+  if (safePoints.length < 2) return null;
+  let totalDistanceM = 0;
+  for (let i = 1; i < safePoints.length; i += 1) {
+    totalDistanceM += haversineMeters(
+      safePoints[i - 1].lat,
+      safePoints[i - 1].lng,
+      safePoints[i].lat,
+      safePoints[i].lng
+    );
+  }
+  const safeSpeed = Math.max(Number(speedMps) || 13.89, 0.8);
+  const durationS = totalDistanceM / safeSpeed;
+  return {
+    geometry: {
+      type: "LineString",
+      coordinates: safePoints.map((p) => [p.lng, p.lat]),
+    },
+    distance: Math.round(totalDistanceM),
+    duration: Math.round(durationS),
+    legs: [],
+  };
+};
 
 const parseLngLat = (value) => {
   const [lng, lat] = String(value || "").split(",").map(Number);
@@ -160,24 +196,54 @@ router.get("/with-poi", async (req, res) => {
 
     const mode = normalizeMode(req.query.mode);
     const profile = mode;
+    const startPoint = parseLngLat(start);
+    const poiPoint = parseLngLat(poi);
+    const endPoint = parseLngLat(end);
+    if (!startPoint || !poiPoint || !endPoint) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid start/poi/end format",
+      });
+    }
 
     const coordinates = `${start};${poi};${end}`;
-    const url = `${OSRM_URL}/route/v1/${profile}/${coordinates}?overview=full&geometries=geojson&steps=true`;
 
     let route = null;
     let fallback = false;
-    try {
-      const osrmRes = await axios.get(url);
-      route = osrmRes.data?.routes?.[0] || null;
-    } catch (err) {
-      if (profile !== "driving") {
-        const fallbackUrl = `${OSRM_URL}/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=true`;
-        const osrmRes = await axios.get(fallbackUrl);
-        route = osrmRes.data?.routes?.[0] || null;
-        fallback = true;
-      } else {
-        throw err;
-      }
+    let warning = null;
+    let osrmBackend = null;
+    const osrm = await fetchOsrmRoute({
+      profile,
+      coordinates,
+      overview: "full",
+      geometries: "geojson",
+      steps: true,
+    });
+    route = osrm.route || null;
+    osrmBackend = osrm.backend || null;
+    if (!route && osrm.errors?.length) {
+      warning = `OSRM ${profile} failed: ${osrm.errors.join(" | ")}`;
+    }
+
+    if (!route && profile !== "driving") {
+      const fallbackOsrm = await fetchOsrmRoute({
+        profile: "driving",
+        coordinates,
+        overview: "full",
+        geometries: "geojson",
+        steps: true,
+      });
+      route = fallbackOsrm.route || null;
+      osrmBackend = fallbackOsrm.backend || osrmBackend;
+      fallback = true;
+      warning = route
+        ? `OSRM profile ${profile} unavailable, fallback to driving.`
+        : `OSRM profile ${profile} unavailable, fallback failed.`;
+    }
+
+    if (!route) {
+      route = buildApproxRoute([startPoint, poiPoint, endPoint], mode === "walking" ? 1.4 : mode === "cycling" ? 4.2 : 13.89);
+      if (route) fallback = true;
     }
 
     if (!route) {
@@ -188,6 +254,8 @@ router.get("/with-poi", async (req, res) => {
       success: true,
       mode,
       mode_fallback: fallback,
+      osrm_backend: osrmBackend,
+      warning,
       optimized_route: {
         geometry: route.geometry,
         distance: route.distance,

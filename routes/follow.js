@@ -3,6 +3,8 @@ import { pool } from "../db/connect.js";
 import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
+const ENABLE_RUNTIME_SCHEMA_MIGRATION = process.env.ENABLE_RUNTIME_SCHEMA_MIGRATION === "1";
+let schemaMigrationNoticePrinted = false;
 
 router.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
@@ -10,6 +12,7 @@ router.use((req, res, next) => {
 });
 
 async function createIndexSafe(sql, indexName) {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) return;
   try {
     await pool.query(sql);
   } catch (e) {
@@ -20,6 +23,13 @@ async function createIndexSafe(sql, indexName) {
 }
 
 async function ensureFollowTable() {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn("[follow] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)");
+    }
+    return;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_follows (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,

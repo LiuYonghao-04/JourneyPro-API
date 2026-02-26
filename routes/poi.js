@@ -4,6 +4,8 @@ import { getNearbyPOIs } from "../models/poi.js";
 import { getPoiPhotoUrls } from "../services/poiPhotos.js";
 
 const router = express.Router();
+const ENABLE_RUNTIME_SCHEMA_MIGRATION = process.env.ENABLE_RUNTIME_SCHEMA_MIGRATION === "1";
+let schemaMigrationNoticePrinted = false;
 
 let ensurePoiSchemaPromise = null;
 const poiPhotoFillInFlight = new Map();
@@ -22,6 +24,13 @@ const isBenignAlterError = (err) => {
 };
 
 const safeAlter = async (sql) => {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn("[poi] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)");
+    }
+    return;
+  }
   try {
     await pool.query(sql);
   } catch (err) {
@@ -30,6 +39,7 @@ const safeAlter = async (sql) => {
 };
 
 const ensurePoiSchema = async () => {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) return;
   if (!ensurePoiSchemaPromise) {
     ensurePoiSchemaPromise = (async () => {
       await safeAlter(`ALTER TABLE poi MODIFY image_url VARCHAR(600) NULL`);

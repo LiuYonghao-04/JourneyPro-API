@@ -113,6 +113,13 @@ async function tryAlter(sql) {
 }
 
 async function ensureTables() {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn("[posts] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)");
+    }
+    return;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS posts (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -683,10 +690,11 @@ router.get("/", async (req, res) => {
        LEFT JOIN post_favorites pfv ON pfv.post_id = p.id AND pfv.user_id = ?
       `
       : "";
+    const fetchLimit = limit + 1;
     const pagingSql = hasCursor ? "LIMIT ?" : "LIMIT ? OFFSET ?";
     const queryParams = viewerId
-      ? [viewerId, viewerId, ...params, limit, ...(hasCursor ? [] : [offset])]
-      : [...params, limit, ...(hasCursor ? [] : [offset])];
+      ? [viewerId, viewerId, ...params, fetchLimit, ...(hasCursor ? [] : [offset])]
+      : [...params, fetchLimit, ...(hasCursor ? [] : [offset])];
     const [rows] = await pool.query(
       `SELECT ${selectFields}${viewerSelect}
        FROM ${postsFrom}
@@ -695,32 +703,34 @@ router.get("/", async (req, res) => {
        ${viewerJoin}
        WHERE ${where}
        ORDER BY ${orderBy}
-       ${pagingSql}`,
+      ${pagingSql}`,
       queryParams
     );
-    const ids = rows.map((r) => r.id);
+    const hasMore = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+    const ids = pageRows.map((r) => r.id);
     const tagsMap = lite ? new Map() : await fetchTags(ids);
     let data = [];
     if (compact) {
-      const needsPrimaryLookup = rows.some((row) => !row.cover_image);
+      const needsPrimaryLookup = pageRows.some((row) => !row.cover_image);
       const primaryImageMap = needsPrimaryLookup ? await fetchPrimaryImages(ids) : new Map();
       data = feedLite
-        ? rows.map((r) => normalizeFeedLite(r, primaryImageMap))
-        : rows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
+        ? pageRows.map((r) => normalizeFeedLite(r, primaryImageMap))
+        : pageRows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
     } else {
       const imagesMap = await fetchImages(ids);
-      const poiIds = rows.map((r) => r.poi_id).filter(Boolean);
+      const poiIds = pageRows.map((r) => r.poi_id).filter(Boolean);
       const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
-      data = rows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
+      data = pageRows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
     }
     const nextCursor =
-      sort === "latest" && rows.length
+      sort === "latest" && pageRows.length
         ? {
-            created_at: rows[rows.length - 1].created_at,
-            id: rows[rows.length - 1].id,
+            created_at: pageRows[pageRows.length - 1].created_at,
+            id: pageRows[pageRows.length - 1].id,
           }
         : null;
-    res.json({ success: true, data, next_cursor: nextCursor });
+    res.json({ success: true, data, next_cursor: nextCursor, has_more: hasMore });
   } catch (err) {
     console.error("list posts error", err);
     res.status(500).json({ success: false, message: "server error" });

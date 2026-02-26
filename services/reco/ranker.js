@@ -342,6 +342,7 @@ export const runRecommendationV2 = async ({
       bucket,
       mode: effectiveModeConfig.mode,
       mode_fallback: routeResult.fallbackUsed,
+      osrm_backend: routeResult.osrmBackend || null,
       warning: routeResult.warning || null,
       base_route: routeResult.route,
       recommended_pois: selectedRows,

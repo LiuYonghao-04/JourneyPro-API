@@ -21,6 +21,7 @@ db/
 # Logs
 # =========================
 logs/
+backups/
 *.log
 npm-debug.log*
 yarn-debug.log*

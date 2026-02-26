@@ -1,8 +1,36 @@
 import express from "express";
-import axios from "axios";
+import { fetchOsrmRoute } from "../services/osrm/client.js";
 
 const router = express.Router();
-const OSRM_URL = process.env.OSRM_URL || "http://localhost:5000";
+
+const haversineMeters = (lat1, lng1, lat2, lng2) => {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+};
+
+const buildApproxRoute = (points) => {
+  const coords = (points || [])
+    .filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+    .map((p) => [Number(p.lng), Number(p.lat)]);
+  if (coords.length < 2) return null;
+  let distance = 0;
+  for (let i = 1; i < coords.length; i += 1) {
+    distance += haversineMeters(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]);
+  }
+  const duration = distance / 13.89;
+  return {
+    geometry: { type: "LineString", coordinates: coords },
+    distance: Math.round(distance),
+    duration: Math.round(duration),
+    legs: [],
+  };
+};
 
 // GET /api/route/with-poi?start=lng,lat&poi=lng,lat&end=lng,lat
 router.get("/with-poi", async (req, res) => {
@@ -15,19 +43,33 @@ router.get("/with-poi", async (req, res) => {
         const [poiLng, poiLat] = poi.split(",").map(Number);
         const [endLng, endLat] = end.split(",").map(Number);
 
-        // 调 OSRM，包含途径点
-        const osrmRes = await axios.get(
-            `${OSRM_URL}/route/v1/driving/${startLng},${startLat};${poiLng},${poiLat};${endLng},${endLat}?overview=full&steps=true&geometries=geojson`
-        );
+        if (![startLng, startLat, poiLng, poiLat, endLng, endLat].every(Number.isFinite)) {
+            return res.status(400).json({ error: "Invalid lng/lat format" });
+        }
 
-        const route = osrmRes.data.routes[0];
+        const coordinates = `${startLng},${startLat};${poiLng},${poiLat};${endLng},${endLat}`;
+        const osrm = await fetchOsrmRoute({
+            profile: "driving",
+            coordinates,
+            overview: "full",
+            geometries: "geojson",
+            steps: true,
+        });
+        const route = osrm.route || buildApproxRoute([
+            { lat: startLat, lng: startLng },
+            { lat: poiLat, lng: poiLng },
+            { lat: endLat, lng: endLng },
+        ]);
         if (!route) return res.status(404).json({ error: "No route found" });
 
-        // 路线距离与时间
+        // 璺嚎璺濈涓庢椂闂?
         const { distance, duration } = route;
 
         res.json({
             success: true,
+            mode_fallback: !osrm.route,
+            osrm_backend: osrm.backend || null,
+            warning: osrm.route ? null : "OSRM unavailable, using linear route approximation.",
             poi: { lat: poiLat, lng: poiLng },
             optimized_route: route,
             stats: {

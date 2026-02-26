@@ -1,6 +1,8 @@
 ﻿import { pool } from "../../db/connect.js";
 
 let ensureRecoTablesPromise = null;
+const ENABLE_RUNTIME_SCHEMA_MIGRATION = process.env.ENABLE_RUNTIME_SCHEMA_MIGRATION === "1";
+let schemaMigrationNoticePrinted = false;
 
 const swallowDuplicateAlter = (err) => {
   const msg = String(err?.message || err || "");
@@ -12,6 +14,13 @@ const swallowDuplicateAlter = (err) => {
 };
 
 const safeAlter = async (sql) => {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn("[reco] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)");
+    }
+    return;
+  }
   try {
     await pool.query(sql);
   } catch (err) {
@@ -20,6 +29,7 @@ const safeAlter = async (sql) => {
 };
 
 export const ensureRecoTables = async () => {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) return;
   if (!ensureRecoTablesPromise) {
     ensureRecoTablesPromise = (async () => {
       await pool.query(`

@@ -1,55 +1,109 @@
-﻿import axios from "axios";
 import { pool } from "../../db/connect.js";
 import { getNearbyPOIs } from "../../models/poi.js";
+import { fetchOsrmRoute } from "../osrm/client.js";
 import { clamp } from "./constants.js";
 import { haversineMeters, mapWithConcurrency } from "./math.js";
 
-const OSRM_URL = process.env.OSRM_URL || "http://localhost:5000";
-
 const pickRouteProfile = (modeConfig) => modeConfig?.osrmProfile || "driving";
 
-const fetchRouteWithProfile = async (coordString, profile) => {
-  const url = `${OSRM_URL}/route/v1/${profile}/${coordString}?overview=full&geometries=geojson&steps=false`;
-  const response = await axios.get(url, { timeout: 12000 });
-  return response?.data?.routes?.[0] || null;
+const fetchRouteWithProfile = async (coordString, profile) =>
+  fetchOsrmRoute({
+    profile,
+    coordinates: coordString,
+    overview: "full",
+    geometries: "geojson",
+    steps: false,
+  });
+
+const buildApproxRoute = (waypoints, modeConfig) => {
+  if (!Array.isArray(waypoints) || waypoints.length < 2) return null;
+  const coords = waypoints
+    .map((point) => [Number(point.lng), Number(point.lat)])
+    .filter((pair) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
+  if (coords.length < 2) return null;
+
+  let totalDistanceM = 0;
+  for (let i = 1; i < coords.length; i += 1) {
+    const [lng1, lat1] = coords[i - 1];
+    const [lng2, lat2] = coords[i];
+    totalDistanceM += haversineMeters(lat1, lng1, lat2, lng2);
+  }
+
+  const speedMps = Math.max(Number(modeConfig?.speedMps) || 13.89, 0.8);
+  const durationS = totalDistanceM / speedMps;
+  return {
+    geometry: {
+      type: "LineString",
+      coordinates: coords,
+    },
+    distance: Math.round(totalDistanceM),
+    duration: Math.round(durationS),
+    legs: [],
+  };
 };
 
 export const buildRouteByMode = async ({ waypoints, modeConfig }) => {
   const coordString = waypoints.map((point) => `${point.lng},${point.lat}`).join(";");
   const requestedProfile = pickRouteProfile(modeConfig);
   let resolvedMode = modeConfig.mode;
-  let warning = null;
+  const warnings = [];
+  let osrmBackend = null;
 
   let route = null;
   try {
-    route = await fetchRouteWithProfile(coordString, requestedProfile);
+    const primary = await fetchRouteWithProfile(coordString, requestedProfile);
+    route = primary.route || null;
+    if (primary.backend) osrmBackend = primary.backend;
+    if (!route && primary.errors?.length) {
+      warnings.push(`OSRM ${requestedProfile} failed: ${primary.errors.join(" | ")}`);
+    }
   } catch (err) {
     if (requestedProfile !== "driving") {
-      warning = `OSRM profile ${requestedProfile} unavailable, fallback to driving.`;
+      warnings.push(`OSRM profile ${requestedProfile} unavailable, fallback to driving.`);
     } else {
-      throw err;
+      warnings.push("OSRM driving profile unavailable, fallback to approximate route.");
     }
   }
 
   if (!route && requestedProfile !== "driving") {
-    route = await fetchRouteWithProfile(coordString, "driving");
-    resolvedMode = "driving";
+    try {
+      const fallback = await fetchRouteWithProfile(coordString, "driving");
+      route = fallback.route || null;
+      if (fallback.backend) osrmBackend = fallback.backend;
+      if (!route && fallback.errors?.length) {
+        warnings.push(`OSRM driving failed: ${fallback.errors.join(" | ")}`);
+      }
+      resolvedMode = "driving";
+    } catch (err) {
+      warnings.push("OSRM driving profile unavailable, fallback to approximate route.");
+    }
+  }
+
+  let fallbackUsed = resolvedMode !== modeConfig.mode;
+  if (!route) {
+    route = buildApproxRoute(waypoints, modeConfig);
+    if (route) {
+      fallbackUsed = true;
+      warnings.push("OSRM unavailable, using linear route approximation.");
+    }
   }
 
   if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates)) {
     return {
       route: null,
       resolvedMode,
-      fallbackUsed: resolvedMode !== modeConfig.mode,
-      warning: warning || "No route found",
+      fallbackUsed,
+      osrmBackend,
+      warning: warnings.length ? warnings.join(" ") : "No route found",
     };
   }
 
   return {
     route,
     resolvedMode,
-    fallbackUsed: resolvedMode !== modeConfig.mode,
-    warning,
+    fallbackUsed,
+    osrmBackend,
+    warning: warnings.length ? warnings.join(" ") : null,
   };
 };
 
