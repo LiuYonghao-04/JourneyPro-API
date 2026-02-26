@@ -1,9 +1,12 @@
 ﻿import express from "express";
 import { pool } from "../db/connect.js";
 import { pushNotification } from "./notifications.js";
+import { insertRecommendationEvents } from "../services/reco/events.js";
 
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
+const ENABLE_RUNTIME_SCHEMA_MIGRATION = process.env.ENABLE_RUNTIME_SCHEMA_MIGRATION === "1";
+let schemaMigrationNoticePrinted = false;
 const POST_SELECT_FIELDS = `
   p.*,
   u.nickname,
@@ -52,6 +55,23 @@ const POST_FEED_LITE_SELECT_FIELDS = `
   poi.lat AS poi_lat,
   poi.lng AS poi_lng
 `;
+const POST_FEED_META_SELECT_FIELDS = `
+  p.id,
+  p.user_id,
+  p.poi_id,
+  p.title,
+  LEFT(p.content, 96) AS content,
+  p.cover_image,
+  p.like_count,
+  p.favorite_count,
+  p.view_count,
+  p.created_at,
+  u.nickname,
+  u.avatar_url,
+  poi.name AS poi_name,
+  poi.lat AS poi_lat,
+  poi.lng AS poi_lng
+`;
 const COMMENT_UNION_COLUMNS = `
   id,
   post_id,
@@ -68,6 +88,15 @@ const COMMENT_UNION_COLUMNS = `
 `;
 
 async function tryAlter(sql) {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn(
+        "[posts] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)"
+      );
+    }
+    return;
+  }
   try {
     await pool.query(sql);
   } catch (e) {
@@ -396,9 +425,67 @@ const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}) => {
   };
 };
 
+const normalizeFeedLite = (row, primaryImageMap, userMap = {}) => {
+  const primaryImage = row.cover_image || primaryImageMap.get(row.id) || "";
+  return {
+    id: row.id,
+    poi_id: row.poi_id,
+    title: row.title,
+    content: String(row.content || ""),
+    cover_image: primaryImage || null,
+    images: primaryImage ? [primaryImage] : [],
+    tags: [],
+    like_count: row.like_count || 0,
+    favorite_count: row.favorite_count || 0,
+    view_count: row.view_count || 0,
+    _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
+    _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
+    created_at: row.created_at,
+    poi: row.poi_id
+      ? {
+          id: row.poi_id,
+          name: row.poi_name || null,
+          lat: Number.isFinite(Number(row.poi_lat)) ? Number(row.poi_lat) : null,
+          lng: Number.isFinite(Number(row.poi_lng)) ? Number(row.poi_lng) : null,
+        }
+      : null,
+    user:
+      userMap[row.id] || {
+        id: row.user_id,
+        nickname: row.nickname || "旅人",
+        avatar_url: row.avatar_url || null,
+      },
+  };
+};
+
 async function fetchUserProfile(userId) {
   const [[u]] = await pool.query(`SELECT id, nickname, avatar_url FROM users WHERE id = ? LIMIT 1`, [userId]);
   return u || { id: userId, nickname: "旅人", avatar_url: null };
+}
+
+async function logRecoPostEvent({ eventType, userId, poiId, postId, eventValue = 1 }) {
+  const safeUserId = Number.parseInt(userId, 10);
+  const safePoiId = Number.parseInt(poiId, 10);
+  const safePostId = Number.parseInt(postId, 10);
+  if (!safeUserId || !safePoiId || !safePostId || !eventType) return;
+  try {
+    await insertRecommendationEvents({
+      user_id: safeUserId,
+      session_id: null,
+      request_id: `post:${eventType}:${safePostId}:${safeUserId}:${Date.now()}`,
+      algorithm_version: "v2_post",
+      bucket: "community",
+      mode: "driving",
+      route_hash: null,
+      poi_id: safePoiId,
+      rank_position: null,
+      event_type: String(eventType),
+      event_value: Number(eventValue) > 0 ? Number(eventValue) : 1,
+      ts: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn("reco post event write failed:", err?.message || err);
+  }
 }
 
 async function fetchImages(postIds) {
@@ -505,6 +592,7 @@ router.get("/", async (req, res) => {
     const sort = req.query.sort === "hot" ? "hot" : "latest";
     const compact = req.query.compact === "1";
     const lite = compact && req.query.lite === "1";
+    const feedLite = compact && req.query.feed_lite === "1";
     const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
     const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
     const viewerIdRaw = req.query.viewer_id ? parseInt(req.query.viewer_id, 10) : null;
@@ -578,7 +666,9 @@ router.get("/", async (req, res) => {
 
     const selectFields = compact
       ? lite
-        ? POST_FEED_LITE_SELECT_FIELDS
+        ? feedLite
+          ? POST_FEED_META_SELECT_FIELDS
+          : POST_FEED_LITE_SELECT_FIELDS
         : POST_FEED_SELECT_FIELDS
       : POST_SELECT_FIELDS;
     const viewerSelect = viewerId
@@ -614,7 +704,9 @@ router.get("/", async (req, res) => {
     if (compact) {
       const needsPrimaryLookup = rows.some((row) => !row.cover_image);
       const primaryImageMap = needsPrimaryLookup ? await fetchPrimaryImages(ids) : new Map();
-      data = rows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
+      data = feedLite
+        ? rows.map((r) => normalizeFeedLite(r, primaryImageMap))
+        : rows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
     } else {
       const imagesMap = await fetchImages(ids);
       const poiIds = rows.map((r) => r.poi_id).filter(Boolean);
@@ -681,6 +773,14 @@ router.get("/:id", async (req, res) => {
       [id]
     );
     if (!row) return res.status(404).json({ success: false, message: "not found" });
+    if (viewerId && row?.poi_id) {
+      await logRecoPostEvent({
+        eventType: "open_posts",
+        userId: viewerId,
+        poiId: row.poi_id,
+        postId: id,
+      });
+    }
     const imagesMap = await fetchImages([id]);
     const tagsMap = await fetchTags([id]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
@@ -805,6 +905,14 @@ router.post("/:id/like", async (req, res) => {
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
+    if (liked && row?.poi_id) {
+      await logRecoPostEvent({
+        eventType: "like_post",
+        userId,
+        poiId: row.poi_id,
+        postId,
+      });
+    }
     if (liked && row.user_id && row.user_id !== userId) {
       const actor = await fetchUserProfile(userId);
       pushNotification(row.user_id, {
@@ -864,6 +972,14 @@ router.post("/:id/favorite", async (req, res) => {
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row?.poi_id], 6);
+    if (favored && row?.poi_id) {
+      await logRecoPostEvent({
+        eventType: "favorite_post",
+        userId,
+        poiId: row.poi_id,
+        postId,
+      });
+    }
     if (favored && row.user_id && row.user_id !== userId) {
       const actor = await fetchUserProfile(userId);
       pushNotification(row.user_id, {

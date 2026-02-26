@@ -3,6 +3,8 @@ import { pool } from "../db/connect.js";
 
 const router = express.Router();
 const subscribers = new Map(); // userId -> Set(res)
+const ENABLE_RUNTIME_SCHEMA_MIGRATION = process.env.ENABLE_RUNTIME_SCHEMA_MIGRATION === "1";
+let schemaMigrationNoticePrinted = false;
 
 router.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
@@ -10,6 +12,15 @@ router.use((req, res, next) => {
 });
 
 async function tryAlter(sql) {
+  if (!ENABLE_RUNTIME_SCHEMA_MIGRATION) {
+    if (!schemaMigrationNoticePrinted) {
+      schemaMigrationNoticePrinted = true;
+      console.warn(
+        "[notifications] runtime schema migration disabled (set ENABLE_RUNTIME_SCHEMA_MIGRATION=1 to enable)"
+      );
+    }
+    return;
+  }
   try {
     await pool.query(sql);
   } catch (err) {
@@ -208,6 +219,7 @@ function toMysqlLocalDatetime(dateInput) {
 function notificationKey(item) {
   return [
     item?.type || "x",
+    item?.source_id || 0,
     item?.actor_id || 0,
     item?.post_id || 0,
     item?.comment_id || 0,
@@ -357,12 +369,17 @@ router.get("/", async (req, res) => {
       : limit;
 
     let sinceSql = "";
-    let sinceValue = "";
-    if (req.query.since) {
-      const d = new Date(String(req.query.since));
+    let sinceValue = 0;
+    let sinceIdValue = 0;
+    const sinceRaw = req.query.since_ts || req.query.since;
+    if (sinceRaw) {
+      const d = new Date(String(sinceRaw));
       if (!Number.isNaN(d.getTime())) {
-        sinceValue = d.toISOString().slice(0, 19).replace("T", " ");
-        sinceSql = " AND __CREATED_AT__ > ? ";
+        sinceValue = Math.floor(d.getTime() / 1000);
+        const sinceIdParsed = parseInt(String(req.query.since_id || "0"), 10);
+        sinceIdValue = Number.isFinite(sinceIdParsed) && sinceIdParsed > 0 ? sinceIdParsed : 0;
+        sinceSql =
+          " AND (UNIX_TIMESTAMP(__CREATED_AT__) > ? OR (UNIX_TIMESTAMP(__CREATED_AT__) = ? AND COALESCE(__SOURCE_ID__, 0) > ?)) ";
       }
     }
 
@@ -373,58 +390,66 @@ router.get("/", async (req, res) => {
     if (include("like")) {
       pieces.push(`
         SELECT * FROM (
-          SELECT 'like' AS type, pl.created_at, pl.user_id AS actor_id,
+          SELECT 'like' AS type, pl.created_at, pl.id AS source_id, pl.user_id AS actor_id,
                  pl.post_id AS post_id, NULL AS comment_id
           FROM post_likes pl
-          WHERE pl.post_owner_id = ? AND pl.user_id <> ? ${sinceSql.replace("__CREATED_AT__", "pl.created_at")}
-          ORDER BY pl.created_at DESC
+          WHERE pl.post_owner_id = ? AND pl.user_id <> ? ${sinceSql
+            .replaceAll("__CREATED_AT__", "pl.created_at")
+            .replaceAll("__SOURCE_ID__", "pl.id")}
+          ORDER BY pl.created_at DESC, pl.id DESC
           LIMIT ${branchLimit}
         ) t_like
       `);
       params.push(userId, userId);
-      if (sinceValue) params.push(sinceValue);
+      if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
     }
     if (include("favorite")) {
       pieces.push(`
         SELECT * FROM (
-          SELECT 'favorite' AS type, pf.created_at, pf.user_id AS actor_id,
+          SELECT 'favorite' AS type, pf.created_at, pf.id AS source_id, pf.user_id AS actor_id,
                  pf.post_id AS post_id, NULL AS comment_id
           FROM post_favorites pf
-          WHERE pf.post_owner_id = ? AND pf.user_id <> ? ${sinceSql.replace("__CREATED_AT__", "pf.created_at")}
-          ORDER BY pf.created_at DESC
+          WHERE pf.post_owner_id = ? AND pf.user_id <> ? ${sinceSql
+            .replaceAll("__CREATED_AT__", "pf.created_at")
+            .replaceAll("__SOURCE_ID__", "pf.id")}
+          ORDER BY pf.created_at DESC, pf.id DESC
           LIMIT ${branchLimit}
         ) t_favorite
       `);
       params.push(userId, userId);
-      if (sinceValue) params.push(sinceValue);
+      if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
     }
     if (include("comment")) {
       pieces.push(`
         SELECT * FROM (
-          SELECT 'comment' AS type, pc.created_at, pc.user_id AS actor_id,
+          SELECT 'comment' AS type, pc.created_at, pc.id AS source_id, pc.user_id AS actor_id,
                  pc.post_id AS post_id, pc.id AS comment_id
           FROM post_comments pc
-          WHERE pc.post_owner_id = ? AND pc.user_id <> ? ${sinceSql.replace("__CREATED_AT__", "pc.created_at")}
-          ORDER BY pc.created_at DESC
+          WHERE pc.post_owner_id = ? AND pc.user_id <> ? ${sinceSql
+            .replaceAll("__CREATED_AT__", "pc.created_at")
+            .replaceAll("__SOURCE_ID__", "pc.id")}
+          ORDER BY pc.created_at DESC, pc.id DESC
           LIMIT ${commentBranchLimit}
         ) t_comment
       `);
       params.push(userId, userId);
-      if (sinceValue) params.push(sinceValue);
+      if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
     }
     if (include("follow")) {
       pieces.push(`
         SELECT * FROM (
-          SELECT 'follow' AS type, uf.created_at, uf.follower_id AS actor_id,
+          SELECT 'follow' AS type, uf.created_at, uf.id AS source_id, uf.follower_id AS actor_id,
                  NULL AS post_id, NULL AS comment_id
           FROM user_follows uf
-          WHERE uf.following_id = ? ${sinceSql.replace("__CREATED_AT__", "uf.created_at")}
-          ORDER BY uf.created_at DESC
+          WHERE uf.following_id = ? ${sinceSql
+            .replaceAll("__CREATED_AT__", "uf.created_at")
+            .replaceAll("__SOURCE_ID__", "uf.id")}
+          ORDER BY uf.created_at DESC, uf.id DESC
           LIMIT ${branchLimit}
         ) t_follow
       `);
       params.push(userId);
-      if (sinceValue) params.push(sinceValue);
+      if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
     }
 
     if (!pieces.length) {
@@ -436,6 +461,7 @@ router.get("/", async (req, res) => {
       SELECT
         n.type,
         n.created_at,
+        n.source_id,
         n.actor_id,
         u.nickname,
         u.avatar_url,
@@ -451,7 +477,7 @@ router.get("/", async (req, res) => {
       LEFT JOIN users u ON u.id = n.actor_id
       LEFT JOIN posts p ON p.id = n.post_id
       LEFT JOIN post_comments pc ON pc.id = n.comment_id
-      ORDER BY n.created_at DESC
+      ORDER BY n.created_at DESC, n.source_id DESC
       LIMIT ?
     `;
 
@@ -463,8 +489,19 @@ router.get("/", async (req, res) => {
       ...item,
       unread: isUnread(item, state),
     }));
-    const cursor = data[0]?.created_at || null;
-    res.json({ success: true, data, state, cursor });
+    const latestCursor = data.length
+      ? {
+          ts: data[0]?.created_at || null,
+          id: Number(data[0]?.source_id || 0) || 0,
+        }
+      : null;
+    res.json({
+      success: true,
+      data,
+      state,
+      cursor: latestCursor?.ts || null,
+      latest_cursor: latestCursor,
+    });
   } catch (err) {
     console.error("notifications error", err);
     res.status(500).json({ success: false, message: "server error" });

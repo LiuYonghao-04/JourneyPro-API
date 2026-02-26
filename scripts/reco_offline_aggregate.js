@@ -8,6 +8,7 @@ const args = process.argv.slice(2);
 const daysArg = args.find((arg) => arg.startsWith("--days="));
 const historyDays = daysArg ? Number.parseInt(daysArg.split("=")[1], 10) : 180;
 const safeHistoryDays = Number.isFinite(historyDays) && historyDays > 0 ? historyDays : 180;
+const JOB_LOCK_KEY = "journeypro_reco_offline_aggregate";
 
 const rewardCaseSql = Object.entries(EVENT_REWARD_WEIGHTS)
   .map(([eventType, weight]) => `WHEN '${eventType}' THEN ${Number(weight)}`)
@@ -261,18 +262,41 @@ const aggregatePoiQualityStats = async () => {
   };
 };
 
+const acquireJobLock = async (timeoutSeconds = 1) => {
+  const [[row]] = await pool.query(`SELECT GET_LOCK(?, ?) AS locked`, [JOB_LOCK_KEY, timeoutSeconds]);
+  return Number(row?.locked) === 1;
+};
+
+const releaseJobLock = async () => {
+  try {
+    await pool.query(`DO RELEASE_LOCK(?)`, [JOB_LOCK_KEY]);
+  } catch {
+    // ignore
+  }
+};
+
 const main = async () => {
   console.log(`[reco:offline] start days=${safeHistoryDays}`);
+  const locked = await acquireJobLock(1);
+  if (!locked) {
+    console.warn("[reco:offline] skip: another offline aggregate job is running");
+    return;
+  }
+
   const startTs = Date.now();
-  await ensureRecoTables();
+  try {
+    await ensureRecoTables();
 
-  const interest = await aggregateUserInterest();
-  const quality = await aggregatePoiQualityStats();
+    const interest = await aggregateUserInterest();
+    const quality = await aggregatePoiQualityStats();
 
-  const elapsed = Date.now() - startTs;
-  console.log(
-    `[reco:offline] done feature_rows=${interest.featureRows} users=${interest.users} quality_rows=${quality.rows} elapsed_ms=${elapsed}`
-  );
+    const elapsed = Date.now() - startTs;
+    console.log(
+      `[reco:offline] done feature_rows=${interest.featureRows} users=${interest.users} quality_rows=${quality.rows} elapsed_ms=${elapsed}`
+    );
+  } finally {
+    await releaseJobLock();
+  }
 };
 
 main()

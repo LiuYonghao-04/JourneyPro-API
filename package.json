@@ -10,6 +10,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "reco:backfill": "node scripts/reco_backfill.js",
     "reco:offline": "node scripts/reco_offline_aggregate.js",
+    "reco:bootstrap-fast": "node scripts/reco_bootstrap_fast.js",
     "poi:expand": "node scripts/poi_expand_details.js",
     "poi:real-images": "node scripts/poi_real_images.js",
     "poi:real-images:baidu": "node scripts/poi_real_images_baidu.js",
