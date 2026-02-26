@@ -103,6 +103,19 @@ router.get("/followers", async (req, res) => {
     await ensureFollowTable();
     const targetId = parseInt(req.query.target_id || "0", 10);
     if (!targetId) return res.json({ success: true, data: [] });
+    const countOnly = String(req.query.count_only || "0") === "1";
+    const limit = Math.max(0, Math.min(parseInt(req.query.limit || "200", 10) || 200, 500));
+    const [[countRow]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM user_follows WHERE following_id = ?`,
+      [targetId]
+    );
+    const count = Number(countRow?.c || 0);
+    if (countOnly) {
+      return res.json({ success: true, data: [], count });
+    }
+    if (limit <= 0 || count <= 0) {
+      return res.json({ success: true, data: [], count });
+    }
     const [rows] = await pool.query(
       `SELECT uf.id, uf.follower_id AS user_id, uf.created_at,
               u.nickname, u.avatar_url
@@ -110,10 +123,10 @@ router.get("/followers", async (req, res) => {
        LEFT JOIN users u ON uf.follower_id = u.id
        WHERE uf.following_id = ?
        ORDER BY uf.created_at DESC
-       LIMIT 200`,
-      [targetId]
+       LIMIT ?`,
+      [targetId, limit]
     );
-    res.json({ success: true, data: rows, count: rows.length });
+    res.json({ success: true, data: rows, count });
   } catch (err) {
     console.error("followers list error", err);
     res.status(500).json({ success: false, message: "server error" });

@@ -40,7 +40,7 @@ const POST_FEED_LITE_SELECT_FIELDS = `
   p.user_id,
   p.poi_id,
   p.title,
-  LEFT(p.content, 180) AS content,
+  LEFT(p.content, 120) AS content,
   p.cover_image,
   p.like_count,
   p.favorite_count,
@@ -197,8 +197,14 @@ async function ensureTables() {
   await tryAlter(`ALTER TABLE post_tags ADD INDEX idx_post_tags_tag_post (tag_id, post_id)`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
   await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_fav_owner_created (post_owner_id, created_at, post_id, user_id)`);
+  await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_user_post (user_id, post_id)`);
+  await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_favorites_user_post (user_id, post_id)`);
+  await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_user_recent (user_id, id, post_id)`);
+  await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_favorites_user_recent (user_id, id, post_id)`);
   await tryAlter(`ALTER TABLE post_comments ADD INDEX idx_post_comments_owner_created (post_owner_id, created_at, post_id, user_id)`);
   await tryAlter(`ALTER TABLE posts ADD INDEX idx_posts_status_created (status, created_at, id)`);
+  await tryAlter(`ALTER TABLE posts ADD INDEX idx_posts_user_created (user_id, created_at, id)`);
+  await tryAlter(`ALTER TABLE posts ADD INDEX idx_posts_status_poi_created (status, poi_id, created_at, id)`);
   await tryAlter(
     `ALTER TABLE posts ADD INDEX idx_posts_status_hot (status, view_count, like_count, favorite_count, created_at, id)`
   );
@@ -226,6 +232,8 @@ const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = 
   like_count: row.like_count || 0,
   favorite_count: row.favorite_count || 0,
   view_count: row.view_count || 0,
+  _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
+  _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
   rating: row.rating,
   status: row.status,
   created_at: row.created_at,
@@ -263,6 +271,8 @@ const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}) => {
     like_count: row.like_count || 0,
     favorite_count: row.favorite_count || 0,
     view_count: row.view_count || 0,
+    _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
+    _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
     created_at: row.created_at,
     poi: row.poi_id
       ? {
@@ -387,16 +397,26 @@ async function upsertTags(tagNames) {
 router.get("/", async (req, res) => {
   try {
     await ensureTablesReady();
-    const limit = Math.min(parseInt(req.query.limit || "30", 10), 50);
-    const offset = parseInt(req.query.offset || "0", 10);
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit || "30", 10) || 30, 50));
+    const offset = Math.max(0, parseInt(req.query.offset || "0", 10) || 0);
     const sort = req.query.sort === "hot" ? "hot" : "latest";
     const compact = req.query.compact === "1";
     const lite = compact && req.query.lite === "1";
     const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
     const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
+    const viewerIdRaw = req.query.viewer_id ? parseInt(req.query.viewer_id, 10) : null;
+    const viewerId = Number.isFinite(viewerIdRaw) && viewerIdRaw > 0 ? viewerIdRaw : null;
     const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
     const favoritedBy = req.query.favorited_by ? parseInt(req.query.favorited_by, 10) : null;
     const poiId = req.query.poi_id ? parseInt(req.query.poi_id, 10) : null;
+    const cursorCreatedAtRaw = req.query.cursor_created_at ? new Date(String(req.query.cursor_created_at)) : null;
+    const cursorIdRaw = req.query.cursor_id ? parseInt(req.query.cursor_id, 10) : null;
+    const hasCursor =
+      sort === "latest" &&
+      cursorCreatedAtRaw instanceof Date &&
+      !Number.isNaN(cursorCreatedAtRaw.getTime()) &&
+      Number.isFinite(cursorIdRaw) &&
+      cursorIdRaw > 0;
 
     let where = "p.status = 'NORMAL'";
     const params = [];
@@ -405,11 +425,13 @@ router.get("/", async (req, res) => {
       params.push(userId);
     }
     if (likedBy) {
-      where += " AND EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = ?)";
+      where +=
+        " AND p.id IN (SELECT t.post_id FROM (SELECT pl.post_id FROM post_likes pl WHERE pl.user_id = ? ORDER BY pl.id DESC LIMIT 30000) t)";
       params.push(likedBy);
     }
     if (favoritedBy) {
-      where += " AND EXISTS (SELECT 1 FROM post_favorites pf WHERE pf.post_id = p.id AND pf.user_id = ?)";
+      where +=
+        " AND p.id IN (SELECT t.post_id FROM (SELECT pf.post_id FROM post_favorites pf WHERE pf.user_id = ? ORDER BY pf.id DESC LIMIT 30000) t)";
       params.push(favoritedBy);
     }
     if (poiId) {
@@ -417,30 +439,64 @@ router.get("/", async (req, res) => {
       params.push(poiId);
     }
     if (tag) {
-      where +=
-        " AND EXISTS (SELECT 1 FROM post_tags pt JOIN tags t ON pt.tag_id = t.id WHERE pt.post_id = p.id AND t.name = ?)";
-      params.push(tag);
+      const [[tagRow]] = await pool.query(`SELECT id FROM tags WHERE name = ? LIMIT 1`, [tag]);
+      if (!tagRow?.id) {
+        return res.json({ success: true, data: [], next_cursor: null });
+      }
+      where += " AND EXISTS (SELECT 1 FROM post_tags pt WHERE pt.post_id = p.id AND pt.tag_id = ?)";
+      params.push(Number(tagRow.id));
+    }
+    if (hasCursor) {
+      where += " AND (p.created_at < ? OR (p.created_at = ? AND p.id < ?))";
+      params.push(cursorCreatedAtRaw, cursorCreatedAtRaw, cursorIdRaw);
     }
 
     const orderBy =
       sort === "hot"
         ? "p.view_count DESC, p.like_count DESC, p.favorite_count DESC, p.created_at DESC"
-        : "p.created_at DESC";
+        : "p.created_at DESC, p.id DESC";
+    let postsFrom = "posts p";
+    if (sort === "hot") {
+      postsFrom = "posts p FORCE INDEX (idx_posts_status_hot)";
+    } else if (userId) {
+      postsFrom = "posts p FORCE INDEX (idx_posts_user_created)";
+    } else if (poiId) {
+      postsFrom = "posts p FORCE INDEX (idx_posts_status_poi_created)";
+    } else {
+      postsFrom = "posts p FORCE INDEX (idx_posts_status_created)";
+    }
 
     const selectFields = compact
       ? lite
         ? POST_FEED_LITE_SELECT_FIELDS
         : POST_FEED_SELECT_FIELDS
       : POST_SELECT_FIELDS;
+    const viewerSelect = viewerId
+      ? `,
+         IF(plv.id IS NULL, 0, 1) AS liked_by_viewer,
+         IF(pfv.id IS NULL, 0, 1) AS favorited_by_viewer
+        `
+      : "";
+    const viewerJoin = viewerId
+      ? `
+       LEFT JOIN post_likes plv ON plv.post_id = p.id AND plv.user_id = ?
+       LEFT JOIN post_favorites pfv ON pfv.post_id = p.id AND pfv.user_id = ?
+      `
+      : "";
+    const pagingSql = hasCursor ? "LIMIT ?" : "LIMIT ? OFFSET ?";
+    const queryParams = viewerId
+      ? [viewerId, viewerId, ...params, limit, ...(hasCursor ? [] : [offset])]
+      : [...params, limit, ...(hasCursor ? [] : [offset])];
     const [rows] = await pool.query(
-      `SELECT ${selectFields}
-       FROM posts p
+      `SELECT ${selectFields}${viewerSelect}
+       FROM ${postsFrom}
        LEFT JOIN users u ON p.user_id = u.id
        LEFT JOIN poi ON p.poi_id = poi.id
+       ${viewerJoin}
        WHERE ${where}
        ORDER BY ${orderBy}
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
+       ${pagingSql}`,
+      queryParams
     );
     const ids = rows.map((r) => r.id);
     const tagsMap = lite ? new Map() : await fetchTags(ids);
@@ -455,7 +511,14 @@ router.get("/", async (req, res) => {
       const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
       data = rows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
     }
-    res.json({ success: true, data });
+    const nextCursor =
+      sort === "latest" && rows.length
+        ? {
+            created_at: rows[rows.length - 1].created_at,
+            id: rows[rows.length - 1].id,
+          }
+        : null;
+    res.json({ success: true, data, next_cursor: nextCursor });
   } catch (err) {
     console.error("list posts error", err);
     res.status(500).json({ success: false, message: "server error" });
