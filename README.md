@@ -11,6 +11,7 @@ JourneyPro API is the Node.js backend for the JourneyPro graduation project. It 
 - [API overview](#api-overview)
 - [Database notes](#database-notes)
 - [Data import scripts](#data-import-scripts)
+- [Maintenance scheduler](#maintenance-scheduler)
 - [Security notes](#security-notes)
 
 ## Highlights
@@ -186,6 +187,58 @@ NAPTAN_CSV_PATH=/path/to/Stops.csv node scripts/import_naptan_stops_csv.js
 # TfL StopPoints import (optional key)
 TFL_APP_KEY=your-key node scripts/import_tfl_stoppoints.js
 ```
+
+## Maintenance scheduler
+
+For production-like stability on large datasets, this repo now includes two scheduled maintenance jobs:
+
+- Hourly `post_comments` hot-table archive sweep (incremental, capped by batch size)
+- Daily DB health + redundant index compaction check/apply
+
+### One-shot manual run
+
+```bash
+npm run ops:run:archive-hourly
+npm run ops:run:db-daily
+```
+
+### Install Windows Task Scheduler jobs
+
+```bash
+npm run ops:schedule:install
+```
+
+Default installed tasks:
+
+- `JourneyPro-CommentsArchive-Hourly` (hourly)
+- `JourneyPro-DBMaintenance-Daily` (03:20 every day)
+
+Customize install parameters (PowerShell):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/scheduler/install_windows_tasks.ps1 `
+  -TaskPrefix JourneyPro `
+  -HourlyStart 00:10 `
+  -DailyTime 03:20 `
+  -RetainHotRows 10000000 `
+  -ArchiveBatchSize 30000 `
+  -ArchiveMaxBatches 3 `
+  -OlderThanDays 0 `
+  -ApplyIndexFix:$true
+```
+
+### Uninstall scheduler jobs
+
+```bash
+npm run ops:schedule:uninstall
+```
+
+### Logs
+
+Maintenance logs are written to:
+
+- `JourneyPro-api/logs/maintenance/comments_archive_hot_YYYYMMDD.log`
+- `JourneyPro-api/logs/maintenance/db_maintenance_daily_YYYYMMDD.log`
 
 ## Security notes
 
