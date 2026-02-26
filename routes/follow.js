@@ -4,6 +4,21 @@ import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
 
+router.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+async function createIndexSafe(sql, indexName) {
+  try {
+    await pool.query(sql);
+  } catch (e) {
+    if (e?.code !== "ER_DUP_KEYNAME") {
+      console.error(`create ${indexName} error`, e);
+    }
+  }
+}
+
 async function ensureFollowTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_follows (
@@ -18,25 +33,32 @@ async function ensureFollowTable() {
       CONSTRAINT chk_follows_not_self CHECK (follower_id <> following_id)
     );
   `);
-  try {
-    await pool.query(`CREATE INDEX idx_follows_follower ON user_follows(follower_id)`);
-  } catch (e) {
-    if (e?.code !== "ER_DUP_KEYNAME") {
-      console.error("create idx_follows_follower error", e);
-    }
+  await createIndexSafe(`CREATE INDEX idx_follows_follower ON user_follows(follower_id)`, "idx_follows_follower");
+  await createIndexSafe(`CREATE INDEX idx_follows_following ON user_follows(following_id)`, "idx_follows_following");
+  await createIndexSafe(
+    `CREATE INDEX idx_follows_following_created ON user_follows(following_id, created_at, follower_id)`,
+    "idx_follows_following_created"
+  );
+  await createIndexSafe(
+    `CREATE INDEX idx_follows_follower_created ON user_follows(follower_id, created_at, following_id)`,
+    "idx_follows_follower_created"
+  );
+}
+
+let ensureFollowTablePromise = null;
+function ensureFollowTableReady() {
+  if (!ensureFollowTablePromise) {
+    ensureFollowTablePromise = ensureFollowTable().catch((err) => {
+      ensureFollowTablePromise = null;
+      throw err;
+    });
   }
-  try {
-    await pool.query(`CREATE INDEX idx_follows_following ON user_follows(following_id)`);
-  } catch (e) {
-    if (e?.code !== "ER_DUP_KEYNAME") {
-      console.error("create idx_follows_following error", e);
-    }
-  }
+  return ensureFollowTablePromise;
 }
 
 router.get("/status", async (req, res) => {
   try {
-    await ensureFollowTable();
+    await ensureFollowTableReady();
     const userId = parseInt(req.query.user_id || "0", 10);
     const targetId = parseInt(req.query.target_id || "0", 10);
     if (!userId || !targetId) return res.json({ success: true, following: false });
@@ -53,7 +75,7 @@ router.get("/status", async (req, res) => {
 
 router.post("/toggle", async (req, res) => {
   try {
-    await ensureFollowTable();
+    await ensureFollowTableReady();
     const followerId = req.body?.user_id;
     const targetId = req.body?.target_id;
     if (!followerId || !targetId) {
@@ -100,7 +122,7 @@ router.post("/toggle", async (req, res) => {
 // GET /api/follow/followers?target_id=1
 router.get("/followers", async (req, res) => {
   try {
-    await ensureFollowTable();
+    await ensureFollowTableReady();
     const targetId = parseInt(req.query.target_id || "0", 10);
     if (!targetId) return res.json({ success: true, data: [] });
     const countOnly = String(req.query.count_only || "0") === "1";

@@ -417,6 +417,13 @@ router.get("/", async (req, res) => {
       !Number.isNaN(cursorCreatedAtRaw.getTime()) &&
       Number.isFinite(cursorIdRaw) &&
       cursorIdRaw > 0;
+    const isPublicFeedCacheable =
+      compact && lite && !viewerId && !userId && !likedBy && !favoritedBy && !poiId && !tag && !hasCursor;
+    if (isPublicFeedCacheable) {
+      res.setHeader("Cache-Control", "public, max-age=20, stale-while-revalidate=40");
+    } else {
+      res.setHeader("Cache-Control", "no-store");
+    }
 
     let where = "p.status = 'NORMAL'";
     const params = [];
@@ -776,6 +783,7 @@ router.post("/:id/favorite", async (req, res) => {
 router.get("/tags/list", async (_req, res) => {
   try {
     await ensureTablesReady();
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=900");
     const [rows] = await pool.query(`SELECT id, name, type FROM tags ORDER BY id DESC LIMIT 50`);
     res.json({ success: true, data: rows });
   } catch (err) {

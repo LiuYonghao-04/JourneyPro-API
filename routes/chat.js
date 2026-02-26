@@ -4,6 +4,21 @@ import { pushNotification } from "./notifications.js";
 
 const router = express.Router();
 
+router.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+async function createIndexSafe(sql, indexName) {
+  try {
+    await pool.query(sql);
+  } catch (e) {
+    if (e?.code !== "ER_DUP_KEYNAME") {
+      console.error(`create ${indexName} error`, e);
+    }
+  }
+}
+
 async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chat_messages (
@@ -18,12 +33,33 @@ async function ensureTables() {
       CONSTRAINT fk_chat_receiver FOREIGN KEY (receiver_id) REFERENCES users(id)
     );
   `);
+  await createIndexSafe(`CREATE INDEX idx_chat_sender_id ON chat_messages(sender_id, id)`, "idx_chat_sender_id");
+  await createIndexSafe(`CREATE INDEX idx_chat_receiver_id ON chat_messages(receiver_id, id)`, "idx_chat_receiver_id");
+  await createIndexSafe(
+    `CREATE INDEX idx_chat_pair_forward ON chat_messages(sender_id, receiver_id, id)`,
+    "idx_chat_pair_forward"
+  );
+  await createIndexSafe(
+    `CREATE INDEX idx_chat_pair_reverse ON chat_messages(receiver_id, sender_id, id)`,
+    "idx_chat_pair_reverse"
+  );
+}
+
+let ensureTablesPromise = null;
+function ensureTablesReady() {
+  if (!ensureTablesPromise) {
+    ensureTablesPromise = ensureTables().catch((err) => {
+      ensureTablesPromise = null;
+      throw err;
+    });
+  }
+  return ensureTablesPromise;
 }
 
 // GET /api/chat/list?user_id=1
 router.get("/list", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const userId = parseInt(req.query.user_id || "0", 10);
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 100);
     if (!userId) return res.json({ success: true, data: [] });
@@ -55,7 +91,7 @@ router.get("/list", async (req, res) => {
 // GET /api/chat/history?user_id=1&peer_id=2
 router.get("/history", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const userId = parseInt(req.query.user_id || "0", 10);
     const peerId = parseInt(req.query.peer_id || "0", 10);
     const limit = Math.min(parseInt(req.query.limit || "100", 10), 200);
@@ -105,7 +141,7 @@ router.get("/search", async (req, res) => {
 // POST /api/chat/send { sender_id, receiver_id, content }
 router.post("/send", async (req, res) => {
   try {
-    await ensureTables();
+    await ensureTablesReady();
     const { sender_id, receiver_id, content } = req.body || {};
     if (!sender_id || !receiver_id || !content) {
       return res.status(400).json({ success: false, message: "sender_id, receiver_id and content are required" });

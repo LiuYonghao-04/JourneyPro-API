@@ -4,6 +4,11 @@ import { pool } from "../db/connect.js";
 const router = express.Router();
 const subscribers = new Map(); // userId -> Set(res)
 
+router.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
 async function tryAlter(sql) {
   try {
     await pool.query(sql);

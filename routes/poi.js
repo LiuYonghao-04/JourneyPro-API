@@ -150,6 +150,7 @@ const ensurePoiPhotos = async (poiRow, options = {}) => {
 // GET /api/poi/search?keyword=xx&limit=10
 router.get("/search", async (req, res) => {
   try {
+    res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     const keyword = normalize(req.query.keyword);
     const limit = Math.min(parseInt(req.query.limit || "10", 10), 50);
     if (!keyword) return res.json({ success: true, data: [] });
@@ -173,6 +174,7 @@ router.get("/search", async (req, res) => {
 // GET /api/poi/nearby?lat=..&lng=..&radius=1000&limit=20&category=food
 router.get("/nearby", async (req, res) => {
   try {
+    res.setHeader("Cache-Control", "public, max-age=15, stale-while-revalidate=30");
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
     const radius = parseInt(req.query.radius || "1000", 10);
@@ -194,6 +196,7 @@ router.get("/nearby", async (req, res) => {
 // GET /api/poi/:id/photos?limit=6
 router.get("/:id/photos", async (req, res) => {
   try {
+    res.setHeader("Cache-Control", "public, max-age=120, stale-while-revalidate=300");
     await ensurePoiSchema();
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ success: false, message: "invalid id" });
@@ -220,6 +223,7 @@ router.get("/:id/photos", async (req, res) => {
 // GET /api/poi/:id
 router.get("/:id", async (req, res) => {
   try {
+    res.setHeader("Cache-Control", "public, max-age=120, stale-while-revalidate=300");
     await ensurePoiSchema();
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ success: false, message: "invalid id" });

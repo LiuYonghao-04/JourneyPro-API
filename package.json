@@ -20,15 +20,17 @@
     "posts:seed-conversations-en": "node scripts/seed_posts_conversations_en.js",
     "posts:comments:backfill-tiered": "node scripts/post_comments_backfill_tiered.js",
     "social:seed": "node scripts/seed_social_interactions.js",
-    "notifications:backfill-owner": "node scripts/backfill_notification_owner_ids.js"
+    "notifications:backfill-owner": "node scripts/backfill_notification_owner_ids.js",
+    "db:health": "node scripts/db_health_check.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@turf/turf": "^7.3.1",
-    "axios": "^1.12.2",
+    "axios": "^1.13.5",
     "bcrypt": "^6.0.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "csv-parse": "^6.1.0",
     "dotenv": "^17.2.3",
@@ -36,5 +38,8 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
     "mysql2": "^3.16.0"
+  },
+  "overrides": {
+    "qs": "6.14.1"
   }
 }

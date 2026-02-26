@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import compression from "compression";
+import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -19,7 +21,25 @@ import recoEventsRouter from "./routes/recoEvents.js";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(compression({ threshold: 1024 }));
+app.use(express.json({ limit: "1mb" }));
+
+const SLOW_API_MS = Number(process.env.SLOW_API_MS || 800);
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `req_${Date.now()}`;
+  res.setHeader("x-request-id", requestId);
+  res.on("finish", () => {
+    if (!req.originalUrl?.startsWith("/api/")) return;
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    if (elapsedMs >= SLOW_API_MS) {
+      console.warn(
+        `[slow-api] ${req.method} ${req.originalUrl} ${res.statusCode} ${elapsedMs.toFixed(1)}ms request_id=${requestId}`
+      );
+    }
+  });
+  next();
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
