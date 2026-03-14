@@ -1,4 +1,5 @@
-﻿import crypto from "crypto";
+﻿import axios from "axios";
+import crypto from "crypto";
 import express from "express";
 import {
   DEFAULT_EXPLORE_WEIGHT,
@@ -9,11 +10,91 @@ import {
 } from "../services/reco/constants.js";
 import { fetchUserRecommendationSettings } from "../services/reco/profiles.js";
 import { runRecommendationV2 } from "../services/reco/ranker.js";
+import { buildPlannerKnowledgePack } from "../services/ai/retrieval.js";
+import { getPlannerLlmConfig, streamPlannerNarrativeFromLlm } from "../services/ai/llm.js";
 
 const router = express.Router();
 
 const DEFAULT_START = { lng: -0.1278, lat: 51.5074 };
 const DEFAULT_END = { lng: -0.118, lat: 51.509 };
+
+const SUPPORTED_CITY = "London";
+const SUPPORTED_SCOPE_ALIASES = [
+  "london",
+  "greater london",
+  "central london",
+  "city of london",
+  "westminster",
+  "camden",
+  "greenwich",
+  "shoreditch",
+  "soho",
+  "south bank",
+  "covent garden",
+  "notting hill",
+  "kensington",
+  "chelsea",
+  "canary wharf",
+];
+const LOCATION_FILLER_TOKENS = new Set([
+  "a",
+  "an",
+  "the",
+  "i",
+  "me",
+  "my",
+  "we",
+  "our",
+  "want",
+  "need",
+  "have",
+  "for",
+  "to",
+  "in",
+  "around",
+  "near",
+  "visit",
+  "visiting",
+  "travel",
+  "trip",
+  "itinerary",
+  "route",
+  "plan",
+  "planning",
+  "one",
+  "two",
+  "three",
+  "four",
+  "five",
+  "day",
+  "days",
+  "weekend",
+  "quick",
+  "today",
+  "tomorrow",
+]);
+const LOCATION_SCOPE_CACHE = new Map();
+const NON_LOCATION_INTENT_TAGS = new Set([
+  "give",
+  "show",
+  "help",
+  "make",
+  "build",
+  "find",
+  "suggest",
+  "recommend",
+  "need",
+  "want",
+  "trail",
+  "walk",
+  "walking",
+  "drive",
+  "driving",
+  "route",
+  "routes",
+  "trip",
+  "travel",
+]);
 
 const CATEGORY_HINTS = [
   {
@@ -158,6 +239,186 @@ const normalizeText = (value) =>
     .replace(/[^a-z0-9\s-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+const CATEGORY_TOKEN_SET = new Set(
+  CATEGORY_HINTS.flatMap((hint) => [hint.category, ...hint.keywords])
+    .flatMap((value) => normalizeText(value).split(" "))
+    .filter(Boolean)
+);
+
+const normalizeLocationText = (value) =>
+  normalizeText(value)
+    .replace(/\b(a1|1-day|one-day)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isSupportedLondonScope = (value) => {
+  const text = normalizeLocationText(value);
+  if (!text) return false;
+  return SUPPORTED_SCOPE_ALIASES.some((alias) => text === alias || text.includes(alias) || alias.includes(text));
+};
+
+const sanitizeLocationCandidate = (value) => {
+  const normalized = normalizeLocationText(value);
+  if (!normalized) return null;
+
+  const tokens = normalized
+    .split(" ")
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  while (tokens.length && LOCATION_FILLER_TOKENS.has(tokens[0])) tokens.shift();
+  while (tokens.length && LOCATION_FILLER_TOKENS.has(tokens[tokens.length - 1])) tokens.pop();
+
+  if (!tokens.length || tokens.length > 4) return null;
+  if (tokens.every((token) => LOCATION_FILLER_TOKENS.has(token) || CATEGORY_TOKEN_SET.has(token))) return null;
+
+  const candidate = tokens.join(" ").trim();
+  if (!candidate) return null;
+  if (CATEGORY_TOKEN_SET.has(candidate)) return null;
+  return candidate;
+};
+
+const LOCATION_PATTERNS = [
+  /\b([a-z][a-z\s-]{1,40}?)\s+(?:trip|itinerary|route|vacation)\b/g,
+  /\b(?:trip|itinerary|route|vacation|travel|visit(?:ing)?|day|plan)\s+(?:to|in|around|for)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:with|for|and|but|prefer|please))|$)/g,
+  /\b(?:in|around|near|to|visit(?:ing)?)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:trip|itinerary|route|with|for|and|but|prefer|please))|$)/g,
+];
+
+const extractLocationCandidates = (prompt) => {
+  const text = normalizeLocationText(prompt);
+  if (!text) return [];
+
+  const found = new Set();
+  LOCATION_PATTERNS.forEach((pattern) => {
+    const regex = new RegExp(pattern.source, pattern.flags);
+    let match = regex.exec(text);
+    while (match) {
+      const candidate = sanitizeLocationCandidate(match[1]);
+      if (candidate) found.add(candidate);
+      match = regex.exec(text);
+    }
+  });
+
+  return [...found].sort((a, b) => b.length - a.length);
+};
+
+const extractFallbackLocationCandidates = (prompt) => {
+  const tags = extractIntentTags(normalizeText(prompt));
+  return tags
+    .filter((token) => token.length >= 4)
+    .filter((token) => !CATEGORY_TOKEN_SET.has(token))
+    .filter((token) => !LOCATION_FILLER_TOKENS.has(token))
+    .filter((token) => !NON_LOCATION_INTENT_TAGS.has(token))
+    .filter((token) => !isSupportedLondonScope(token))
+    .slice(0, 3);
+};
+
+const resolvePromptScope = async (prompt) => {
+  const explicitCandidates = extractLocationCandidates(prompt);
+  const fallbackCandidates = explicitCandidates.length ? [] : extractFallbackLocationCandidates(prompt);
+  const candidates = explicitCandidates.length ? explicitCandidates : fallbackCandidates;
+  const strictUnsupportedFallback = candidates.length > 0;
+  if (!candidates.length) {
+    return {
+      supported: true,
+      requestedLocation: null,
+      resolvedLocation: null,
+    };
+  }
+
+  for (const candidate of candidates) {
+    if (isSupportedLondonScope(candidate)) {
+      return {
+        supported: true,
+        requestedLocation: candidate,
+        resolvedLocation: SUPPORTED_CITY,
+      };
+    }
+
+    const cacheKey = candidate;
+    if (LOCATION_SCOPE_CACHE.has(cacheKey)) {
+      const cached = LOCATION_SCOPE_CACHE.get(cacheKey);
+      if (!cached.supported) return cached;
+      continue;
+    }
+
+    try {
+      const response = await axios.get("https://nominatim.openstreetmap.org/search", {
+        params: {
+          format: "json",
+          q: candidate,
+          limit: 1,
+          addressdetails: 1,
+        },
+        timeout: 1500,
+        headers: {
+          "User-Agent": "JourneyPro-AIPlanner/1.0",
+        },
+        validateStatus: () => true,
+      });
+
+      const row = Array.isArray(response.data) ? response.data[0] : null;
+      if (!row) {
+        if (strictUnsupportedFallback) {
+          return {
+            supported: false,
+            requestedLocation: candidate,
+            resolvedLocation: candidate,
+          };
+        }
+        continue;
+      }
+
+      const resolvedText = normalizeLocationText(
+        [row.display_name, row?.address?.city, row?.address?.town, row?.address?.state, row?.address?.country]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const resolvedLocation =
+        row?.address?.city ||
+        row?.address?.town ||
+        row?.address?.state ||
+        row?.display_name ||
+        candidate;
+      const scoped = {
+        supported: isSupportedLondonScope(resolvedText),
+        requestedLocation: candidate,
+        resolvedLocation,
+      };
+      LOCATION_SCOPE_CACHE.set(cacheKey, scoped);
+      if (LOCATION_SCOPE_CACHE.size > 120) {
+        const firstKey = LOCATION_SCOPE_CACHE.keys().next().value;
+        if (firstKey) LOCATION_SCOPE_CACHE.delete(firstKey);
+      }
+      if (!scoped.supported) return scoped;
+    } catch (err) {
+      if (strictUnsupportedFallback) {
+        return {
+          supported: false,
+          requestedLocation: candidate,
+          resolvedLocation: candidate,
+        };
+      }
+      // Ignore fallback scope detection failures for ambiguous free-text prompts.
+    }
+  }
+
+  return {
+    supported: true,
+    requestedLocation: candidates[0] || null,
+    resolvedLocation: null,
+  };
+};
+const buildScopeGuardNarrative = ({ requestedLocation }) => {
+  const place = requestedLocation || "that city";
+  return [
+    "JourneyPro AI Planner currently supports " + SUPPORTED_CITY + " only.",
+    "Your request points to " + place + ", but the live map, POI index, route scoring, and via-point writeback are all scoped to " + SUPPORTED_CITY + ".",
+    "I will not fabricate a " + place + " itinerary with " + SUPPORTED_CITY + " data.",
+    "Please switch the request to " + SUPPORTED_CITY + ", or set a " + SUPPORTED_CITY + " route on the map and try again.",
+  ].join(" ");
+};
 
 const includesAnyKeyword = (text, keywords) => keywords.some((keyword) => text.includes(keyword));
 
@@ -583,6 +844,8 @@ const buildNarrative = ({
   exploreWeight,
   intent,
   itinerary,
+  knowledgePack,
+  llmMode,
 }) => {
   const list = Array.isArray(items) ? items.slice(0, 6) : [];
   const interestPct = Math.round(clamp(Number(interestWeight) || DEFAULT_INTEREST_WEIGHT, 0, 1) * 100);
@@ -592,6 +855,8 @@ const buildNarrative = ({
   const tripDistance = route?.distance ? toKm(route.distance) : null;
   const tripDuration = route?.duration ? toMin(route.duration) : null;
   const top = list[0];
+  const sourceCards = Array.isArray(knowledgePack?.cards) ? knowledgePack.cards : [];
+  const insights = Array.isArray(knowledgePack?.insights) ? knowledgePack.insights : [];
 
   const lines = [
     "AI planner completed a route-aware first draft.",
@@ -599,14 +864,28 @@ const buildNarrative = ({
     `Ranking profile: Interest ${interestPct}% / Distance ${distancePct}%, Explore ${explorePct}% / Safe ${safePct}% (order only, no category suppression).`,
   ];
 
+  if (llmMode === "fallback") {
+    lines.push("External LLM output was unavailable, so this answer is generated from JourneyPro route ranking and local community evidence.");
+  }
+
   if (tripDistance || tripDuration) {
     lines.push(`Base route estimate: ${tripDistance || "N/A"} and ${tripDuration || "N/A"}.`);
   }
 
   if (top) {
-    lines.push(
-      `Top anchor: ${top.name} (${top.category || "poi"}) with detour ${toMin(top.detour_duration_s)} and route distance ${toKm(top.distance_m)}.`
-    );
+    lines.push(`Top anchor: ${top.name} (${top.category || "poi"}) with detour ${toMin(top.detour_duration_s)} and route distance ${toKm(top.distance_m)}.`);
+  }
+
+  if (insights.length) {
+    lines.push("");
+    lines.push("Community evidence:");
+    insights.slice(0, 4).forEach((line) => lines.push(`- ${line}`));
+  }
+
+  if (sourceCards.length) {
+    lines.push("");
+    lines.push("Evidence cards:");
+    sourceCards.slice(0, 4).forEach((card) => lines.push(`- ${card.type.toUpperCase()} | ${card.title}: ${card.snippet}`));
   }
 
   lines.push("");
@@ -616,11 +895,7 @@ const buildNarrative = ({
     segments.forEach((segment) => {
       lines.push(`${segment.label} - ${segment.title}: ${segment.summary}`);
       (segment.stops || []).forEach((stop) => {
-        lines.push(
-          `  - ${stop.order}. ${stop.name} (${stop.category || "poi"}) | ${toKm(stop.distance_m)} | detour ${toMin(
-            stop.detour_duration_s
-          )}`
-        );
+        lines.push(`  - ${stop.order}. ${stop.name} (${stop.category || "poi"}) | ${toKm(stop.distance_m)} | detour ${toMin(stop.detour_duration_s)}`);
       });
     });
   } else {
@@ -636,7 +911,6 @@ const buildNarrative = ({
   lines.push(`Request summary: "${String(prompt || "").trim()}"`);
   return lines.join("\n");
 };
-
 const mapRecommendedItem = (item) => {
   const scores = {
     final: Number(item?.scores?.final ?? item?.final_score ?? item?.base_score ?? 0),
@@ -754,8 +1028,79 @@ router.post("/planner/stream", async (req, res) => {
     const interestWeight = tunedWeights.interestWeight;
     const exploreWeight = tunedWeights.exploreWeight;
     const categoryHint = parsedIntent.preferredCategories[0] || inferCategoryHint(prompt);
+    const scope = await resolvePromptScope(prompt);
 
     const responseLimit = clamp(limit, 3, 12);
+
+    if (!scope.supported) {
+      writeSse(res, "meta", {
+        request_id: requestId,
+        mode,
+        prompt_summary: buildIntentSummary(parsedIntent),
+        interest_weight: interestWeight,
+        distance_weight: 1 - interestWeight,
+        explore_weight: exploreWeight,
+        intent: {
+          pace: parsedIntent.pace,
+          exploration: parsedIntent.exploration,
+          duration_hint: parsedIntent.durationHint,
+          preferred_categories: parsedIntent.preferredCategories,
+          avoid_categories: parsedIntent.avoidCategories,
+          tags: parsedIntent.intentTags,
+        },
+        category_hint: categoryHint,
+        scope: {
+          supported: false,
+          supported_city: SUPPORTED_CITY,
+          requested_location: scope.requestedLocation,
+          resolved_location: scope.resolvedLocation,
+        },
+        route: {
+          start: startPoint,
+          end: endPoint,
+          via_count: viaPoints.length,
+        },
+      });
+      writeSse(res, "status", {
+        stage: "scope_guard",
+        message: SUPPORTED_CITY + "-only planner scope detected.",
+      });
+      await streamText(
+        res,
+        buildScopeGuardNarrative({ requestedLocation: scope.resolvedLocation || scope.requestedLocation }),
+        () => clientClosed
+      );
+      if (clientClosed) return;
+      writeSse(res, "recommendations", {
+        request_id: requestId,
+        mode,
+        route: null,
+        profile: {
+          interest_weight: interestWeight,
+          distance_weight: 1 - interestWeight,
+          explore_weight: exploreWeight,
+        },
+        intent: {
+          summary: buildIntentSummary(parsedIntent),
+          pace: parsedIntent.pace,
+          exploration: parsedIntent.exploration,
+          preferred_categories: parsedIntent.preferredCategories,
+          avoid_categories: parsedIntent.avoidCategories,
+          tags: parsedIntent.intentTags,
+        },
+        itinerary: null,
+        items: [],
+        scope: {
+          supported: false,
+          supported_city: SUPPORTED_CITY,
+          requested_location: scope.requestedLocation,
+          resolved_location: scope.resolvedLocation,
+        },
+      });
+      writeSse(res, "done", { request_id: requestId, recommendation_count: 0 });
+      res.end();
+      return;
+    }
     const recallLimit = clamp(responseLimit + 8, responseLimit, 20);
 
     writeSse(res, "meta", {
@@ -778,6 +1123,10 @@ router.post("/planner/stream", async (req, res) => {
         start: startPoint,
         end: endPoint,
         via_count: viaPoints.length,
+      },
+      scope: {
+        supported: true,
+        supported_city: SUPPORTED_CITY,
       },
     });
     writeSse(res, "status", { stage: "analyzing", message: "Analyzing trip demand and route context..." });
@@ -828,19 +1177,73 @@ router.post("/planner/stream", async (req, res) => {
       route: payload.base_route || null,
     });
 
-    const narrative = buildNarrative({
+    const knowledgePack = await buildPlannerKnowledgePack({
       prompt,
-      items: rankedItems,
-      route: payload.base_route || null,
-      interestWeight,
-      exploreWeight,
-      intent: parsedIntent,
-      itinerary,
+      rankedItems,
     });
 
-    writeSse(res, "status", { stage: "streaming", message: "Streaming itinerary draft..." });
-    await streamText(res, narrative, () => clientClosed);
+    const llmConfig = getPlannerLlmConfig();
+    let llmResult = {
+      ok: false,
+      mode: llmConfig.configured ? "fallback" : "local-fallback",
+      provider: llmConfig.provider,
+      model: llmConfig.model || "",
+      styleProfile: llmConfig.styleProfile,
+      reason: llmConfig.configured ? "not_started" : "missing_llm_config",
+      text: "",
+    };
+
+    writeSse(res, "status", {
+      stage: llmConfig.configured ? "retrieval" : "fallback",
+      message: llmConfig.configured
+        ? "Retrieved route and community evidence. Generating AI answer..."
+        : "Retrieved route and community evidence. Using local fallback narrative...",
+    });
+
+    if (llmConfig.configured) {
+      try {
+        llmResult = await streamPlannerNarrativeFromLlm({
+          prompt,
+          itinerary,
+          promptContext: knowledgePack.prompt_context,
+          interestWeight,
+          exploreWeight,
+          onToken: (token) => {
+            if (!token || clientClosed) return;
+            writeSse(res, "delta", { token, text: token });
+          },
+        });
+      } catch (llmErr) {
+        llmResult = {
+          ok: false,
+          mode: "fallback",
+          provider: llmConfig.provider,
+          model: llmConfig.model || "",
+          styleProfile: llmConfig.styleProfile,
+          reason: llmErr?.message || "llm_stream_failed",
+          text: "",
+        };
+      }
+    }
+
     if (clientClosed) return;
+
+    if (!llmResult.ok || !String(llmResult.text || "").trim()) {
+      const narrative = buildNarrative({
+        prompt,
+        items: rankedItems,
+        route: payload.base_route || null,
+        interestWeight,
+        exploreWeight,
+        intent: parsedIntent,
+        itinerary,
+        knowledgePack,
+        llmMode: "fallback",
+      });
+      writeSse(res, "status", { stage: "streaming", message: "Streaming fallback itinerary draft..." });
+      await streamText(res, narrative, () => clientClosed);
+      if (clientClosed) return;
+    }
 
     writeSse(res, "itinerary", {
       request_id: payload.request_id || requestId,
@@ -871,8 +1274,22 @@ router.post("/planner/stream", async (req, res) => {
       },
       itinerary,
       items: rankedItems,
+      scope: {
+        supported: true,
+        supported_city: SUPPORTED_CITY,
+      },
+      retrieval: knowledgePack.stats,
+      insights: knowledgePack.insights,
+      sources: knowledgePack.cards,
+      llm: {
+        configured: llmConfig.configured,
+        provider: llmResult.provider || llmConfig.provider,
+        model: llmResult.model || llmConfig.model || "",
+        mode: llmResult.ok ? llmResult.mode : "fallback",
+        style_profile: llmResult.styleProfile || llmConfig.styleProfile,
+        reason: llmResult.reason || null,
+      },
     });
-
     writeSse(res, "done", {
       request_id: payload.request_id || requestId,
       recommendation_count: rankedItems.length,

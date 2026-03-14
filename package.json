@@ -37,6 +37,7 @@
     "db:rollback:index-v2": "node scripts/db_rollback_index_compaction_v2.js",
     "comments:archive:hot": "node scripts/post_comments_archive_hot.js",
     "comments:archive:rollback": "node scripts/post_comments_archive_rollback.js",
+    "ai:finetune:export": "node scripts/ai_export_finetune_dataset.js",
     "loadtest:core": "node scripts/load_test_core_api.js",
     "release:check": "node scripts/release_precheck.js",
     "ops:run:archive-hourly": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/scheduler/run_comments_archive_hot.ps1",

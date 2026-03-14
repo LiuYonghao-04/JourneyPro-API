@@ -24,6 +24,11 @@ JourneyPro API is the Node.js backend for the JourneyPro graduation project. It 
   - SSE stream (`/api/notifications/stream`) for real-time updates
 - Chat (basic DM) with notification push
 - Image upload (multipart) + safe image proxy (SSRF-protected, CORS-friendly for the frontend cropper)
+- AI planner stack:
+  - route-aware recommendation as the hard planning layer
+  - community-grounded retrieval over posts / comments / POI metadata
+  - optional external LLM streaming via OpenAI-compatible API
+  - fine-tune dataset export scaffold for style tuning
 - Route endpoints:
   - `GET /api/route/with-poi` for routing with a selected POI
   - `GET /api/route/recommend` for along-route POI recommendation (interest vs distance tuning affects ordering only)
@@ -73,6 +78,13 @@ OSRM_ENABLE_PUBLIC_FALLBACK=1
 OSRM_LOCAL_TIMEOUT_MS=600
 OSRM_REMOTE_TIMEOUT_MS=12000
 OSRM_DOWN_COOLDOWN_MS=15000
+LLM_PROVIDER=openai-compatible
+LLM_API_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=
+LLM_MODEL=
+LLM_TEMPERATURE=0.45
+LLM_MAX_TOKENS=520
+LLM_STYLE_PROFILE=journeypro_trip_planner_v1
 ```
 
 ### Run
@@ -101,6 +113,13 @@ Server will listen on `http://localhost:3001` by default.
 | `OSRM_LOCAL_TIMEOUT_MS` | `600` | Timeout for local/private OSRM backends |
 | `OSRM_REMOTE_TIMEOUT_MS` | `12000` | Timeout for public/remote OSRM backends |
 | `OSRM_DOWN_COOLDOWN_MS` | `15000` | Circuit-break cooldown after backend failure |
+| `LLM_PROVIDER` | `openai-compatible` | External LLM transport; current implementation uses an OpenAI-compatible chat-completions API |
+| `LLM_API_BASE_URL` | `https://api.openai.com/v1` | Base URL for the external LLM provider |
+| `LLM_API_KEY` | _(empty)_ | API key for the external LLM provider |
+| `LLM_MODEL` | _(empty)_ | Model name, for example `gpt-4o-mini` |
+| `LLM_TEMPERATURE` | `0.45` | Sampling temperature for AI planner narrative generation |
+| `LLM_MAX_TOKENS` | `520` | Max output tokens requested from the external LLM |
+| `LLM_STYLE_PROFILE` | `journeypro_trip_planner_v1` | Style/profile label forwarded into the planner prompt |
 | `ENABLE_RUNTIME_SCHEMA_MIGRATION` | `0` | `1` enables route-time DDL; keep `0` in release |
 | `SLOW_API_MS` | `800` | Slow API warning threshold |
 | `METRIC_SAMPLE_LIMIT` | `400` | In-memory latency sample count per endpoint |
@@ -142,6 +161,21 @@ Base path: `/api`
 
 - `GET /api/route/with-poi?start=lng,lat&poi=lng,lat&end=lng,lat`
 - `GET /api/route/recommend?start=lng,lat&end=lng,lat&via=lng,lat;lng,lat&user_id=1&interest_weight=0.5`
+
+### AI planner
+
+- `POST /api/ai/planner/stream`
+  - SSE response with:
+    - `meta` for prompt summary, scope, and slider-adjusted weights
+    - `status` for planner stages
+    - `delta` for token-level streamed narrative
+    - `recommendations` for itinerary, POIs, retrieval diagnostics, community insights, and source cards
+    - `done` when the stream completes
+  - scope guard:
+    - London-only by design
+    - explicit non-London prompts are rejected with `scope.supported=false`
+  - fallback behavior:
+    - if no external LLM is configured, the route engine + retrieval layer still produce a grounded local narrative
 
 ### Recommendation settings / profile
 
@@ -217,6 +251,26 @@ For production-like stability on large datasets, this repo now includes two sche
 
 - Hourly `post_comments` hot-table archive sweep (incremental, capped by batch size)
 - Daily DB health + redundant index compaction check/apply
+
+## AI planner stack
+
+JourneyPro now exposes a three-layer AI planner architecture:
+
+1. Retrieval-grounded answering
+   - pulls POI-linked posts, comments, and metadata that match the current route and prompt
+   - returns `insights` and `sources` so the frontend can show evidence, not just text
+2. Retrieval + route planning
+   - reuses the existing along-route recommender as the hard ranking system
+   - converts the ranked result set into a segmented itinerary (`morning / afternoon / evening`)
+3. Fine-tune export scaffold
+   - `npm run ai:finetune:export`
+   - exports high-signal post examples to `artifacts/ai/journeypro_finetune_dataset.jsonl`
+   - intended for later style tuning, not for storing factual knowledge
+
+Notes:
+
+- The retrieval layer is intentionally narrow and route-aware to stay usable on large tables.
+- External LLM usage is optional. Without `LLM_API_KEY` and `LLM_MODEL`, the planner falls back to a local grounded narrative.
 
 ### One-shot manual run
 
