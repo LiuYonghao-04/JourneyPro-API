@@ -2,6 +2,10 @@ import axios from "axios";
 
 const DEFAULT_LOCAL_OSRM = "http://localhost:5000";
 const DEFAULT_PUBLIC_OSRM = "https://router.project-osrm.org";
+const OSRM_ROUTE_CACHE_TTL_MS = Math.max(
+  10 * 1000,
+  Math.min(Number(process.env.OSRM_ROUTE_CACHE_TTL_MS || 5 * 60 * 1000), 60 * 60 * 1000)
+);
 
 const OSRM_LOCAL_TIMEOUT_MS = Math.max(
   200,
@@ -10,6 +14,10 @@ const OSRM_LOCAL_TIMEOUT_MS = Math.max(
 const OSRM_REMOTE_TIMEOUT_MS = Math.max(
   300,
   Math.min(Number(process.env.OSRM_REMOTE_TIMEOUT_MS || 12000), 20000)
+);
+const OSRM_RECOMMEND_TIMEOUT_MS = Math.max(
+  400,
+  Math.min(Number(process.env.OSRM_RECOMMEND_TIMEOUT_MS || 1200), OSRM_REMOTE_TIMEOUT_MS)
 );
 const OSRM_DOWN_COOLDOWN_MS = Math.max(
   1000,
@@ -50,6 +58,8 @@ const parseBackends = () => {
 
 const OSRM_BACKENDS = parseBackends();
 const backendCircuitMap = new Map(); // backend -> next available timestamp
+const routeCache = new Map(); // request signature -> { ts, result }
+const inflightRouteMap = new Map(); // request signature -> Promise<result>
 
 const getBackendHost = (backend) => {
   try {
@@ -122,6 +132,52 @@ const buildRouteUrl = ({
   return `${backend}/route/v1/${profile}/${coordinates}?${query}`;
 };
 
+const buildRouteSignature = ({
+  profile,
+  coordinates,
+  overview,
+  geometries,
+  steps,
+  alternatives,
+  annotations,
+}) =>
+  JSON.stringify({
+    profile: String(profile || "driving"),
+    coordinates: String(coordinates || "").trim(),
+    overview: String(overview || "full"),
+    geometries: String(geometries || "geojson"),
+    steps: !!steps,
+    alternatives: !!alternatives,
+    annotations: !!annotations,
+  });
+
+const cloneResult = (result) => {
+  if (!result || typeof result !== "object") return result;
+  return {
+    ...result,
+    attempted: Array.isArray(result.attempted) ? result.attempted.map((item) => ({ ...item })) : [],
+    errors: Array.isArray(result.errors) ? [...result.errors] : [],
+  };
+};
+
+const getCachedRoute = (signature) => {
+  const cached = routeCache.get(signature);
+  if (!cached) return null;
+  if (Date.now() - cached.ts > OSRM_ROUTE_CACHE_TTL_MS) {
+    routeCache.delete(signature);
+    return null;
+  }
+  return cloneResult(cached.result);
+};
+
+const setCachedRoute = (signature, result) => {
+  if (!signature || !result?.ok || !result?.route) return;
+  routeCache.set(signature, {
+    ts: Date.now(),
+    result: cloneResult(result),
+  });
+};
+
 export const getOsrmBackends = () => [...OSRM_BACKENDS];
 
 export const fetchOsrmRoute = async ({
@@ -132,9 +188,19 @@ export const fetchOsrmRoute = async ({
   steps = false,
   alternatives = false,
   annotations = false,
+  timeoutMsOverride = null,
 }) => {
   const safeCoordinates = String(coordinates || "").trim();
   const safeProfile = String(profile || "driving").trim();
+  const signature = buildRouteSignature({
+    profile: safeProfile,
+    coordinates: safeCoordinates,
+    overview,
+    geometries,
+    steps,
+    alternatives,
+    annotations,
+  });
   if (!safeCoordinates) {
     return { ok: false, route: null, backend: null, errors: ["empty_coordinates"] };
   }
@@ -142,55 +208,87 @@ export const fetchOsrmRoute = async ({
     return { ok: false, route: null, backend: null, errors: ["no_osrm_backends_configured"] };
   }
 
-  const errors = [];
-  const attempted = [];
-
-  for (const backend of OSRM_BACKENDS) {
-    if (!isBackendOpen(backend)) {
-      errors.push(`${backend}:circuit_open`);
-      continue;
-    }
-
-    const timeout = getBackendTimeout(backend);
-    const url = buildRouteUrl({
-      backend,
-      profile: safeProfile,
-      coordinates: safeCoordinates,
-      overview,
-      geometries,
-      steps,
-      alternatives,
-      annotations,
-    });
-
-    attempted.push({ backend, timeout });
-    try {
-      const response = await axios.get(url, { timeout, validateStatus: () => true });
-      const statusCode = Number(response.status || 0);
-      const route = response?.data?.routes?.[0] || null;
-      if (statusCode >= 200 && statusCode < 300 && route) {
-        markBackendSuccess(backend);
-        return {
-          ok: true,
-          route,
-          backend,
-          attempted,
-          errors,
-        };
-      }
-      markBackendFailure(backend);
-      errors.push(`${backend}:status_${statusCode}`);
-    } catch (err) {
-      markBackendFailure(backend);
-      errors.push(`${backend}:${err?.code || err?.message || "request_failed"}`);
-    }
+  const cached = getCachedRoute(signature);
+  if (cached) {
+    return {
+      ...cached,
+      cached: true,
+    };
   }
 
-  return {
-    ok: false,
-    route: null,
-    backend: null,
-    attempted,
-    errors,
-  };
+  if (inflightRouteMap.has(signature)) {
+    const pending = await inflightRouteMap.get(signature);
+    return {
+      ...cloneResult(pending),
+      shared: true,
+    };
+  }
+
+  const requestPromise = (async () => {
+    const errors = [];
+    const attempted = [];
+
+    for (const backend of OSRM_BACKENDS) {
+      if (!isBackendOpen(backend)) {
+        errors.push(`${backend}:circuit_open`);
+        continue;
+      }
+
+      const timeout = Math.max(
+        100,
+        Number.isFinite(Number(timeoutMsOverride)) ? Number(timeoutMsOverride) : getBackendTimeout(backend)
+      );
+      const url = buildRouteUrl({
+        backend,
+        profile: safeProfile,
+        coordinates: safeCoordinates,
+        overview,
+        geometries,
+        steps,
+        alternatives,
+        annotations,
+      });
+
+      attempted.push({ backend, timeout });
+      try {
+        const response = await axios.get(url, { timeout, validateStatus: () => true });
+        const statusCode = Number(response.status || 0);
+        const route = response?.data?.routes?.[0] || null;
+        if (statusCode >= 200 && statusCode < 300 && route) {
+          markBackendSuccess(backend);
+          const result = {
+            ok: true,
+            route,
+            backend,
+            attempted,
+            errors,
+          };
+          setCachedRoute(signature, result);
+          return result;
+        }
+        markBackendFailure(backend);
+        errors.push(`${backend}:status_${statusCode}`);
+      } catch (err) {
+        markBackendFailure(backend);
+        errors.push(`${backend}:${err?.code || err?.message || "request_failed"}`);
+      }
+    }
+
+    return {
+      ok: false,
+      route: null,
+      backend: null,
+      attempted,
+      errors,
+    };
+  })();
+
+  inflightRouteMap.set(signature, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    inflightRouteMap.delete(signature);
+  }
 };
+
+export const getRecommendRouteTimeoutMs = () => OSRM_RECOMMEND_TIMEOUT_MS;

@@ -1,8 +1,15 @@
 import { pool } from "../../db/connect.js";
 import { getNearbyPOIs } from "../../models/poi.js";
-import { fetchOsrmRoute } from "../osrm/client.js";
+import { fetchOsrmRoute, getRecommendRouteTimeoutMs } from "../osrm/client.js";
 import { clamp } from "./constants.js";
 import { haversineMeters, mapWithConcurrency } from "./math.js";
+
+const RECALL_CACHE_TTL_MS = Math.max(
+  10 * 1000,
+  Math.min(Number(process.env.RECO_RECALL_CACHE_TTL_MS || 3 * 60 * 1000), 30 * 60 * 1000)
+);
+const recallCache = new Map();
+const inflightRecallMap = new Map();
 
 const pickRouteProfile = (modeConfig) => modeConfig?.osrmProfile || "driving";
 
@@ -10,9 +17,10 @@ const fetchRouteWithProfile = async (coordString, profile) =>
   fetchOsrmRoute({
     profile,
     coordinates: coordString,
-    overview: "full",
+    overview: "simplified",
     geometries: "geojson",
     steps: false,
+    timeoutMsOverride: getRecommendRouteTimeoutMs(),
   });
 
 const buildApproxRoute = (waypoints, modeConfig) => {
@@ -165,6 +173,60 @@ const findNearestSample = (samples, lat, lng) => {
   return { index: bestIndex, distanceM: bestDistance };
 };
 
+const stableCoords = (coords) =>
+  (Array.isArray(coords) ? coords : []).map((pair) => [
+    Number(Number(pair?.[0] || 0).toFixed(5)),
+    Number(Number(pair?.[1] || 0).toFixed(5)),
+  ]);
+
+const buildRecallSignature = ({
+  route,
+  modeConfig,
+  userProfile,
+  category,
+  candidateLimit,
+  perSampleLimit,
+  radiusOverride,
+}) =>
+  JSON.stringify({
+    mode: String(modeConfig?.mode || "driving"),
+    category: String(category || ""),
+    candidateLimit: Number(candidateLimit) || 0,
+    perSampleLimit: Number(perSampleLimit) || 0,
+    radiusOverride: Number(radiusOverride) || 0,
+    topCategories: (userProfile?.topCategories || []).slice(0, 3).map((value) => String(value || "").trim().toLowerCase()),
+    routeDistance: Math.round(Number(route?.distance) || 0),
+    routeCoords: stableCoords(route?.geometry?.coordinates),
+  });
+
+const cloneRecallResult = (result) => {
+  if (!result || typeof result !== "object") return result;
+  return {
+    ...result,
+    candidates: Array.isArray(result.candidates) ? result.candidates.map((item) => ({ ...item, sourceList: Array.isArray(item.sourceList) ? [...item.sourceList] : [] })) : [],
+    samples: Array.isArray(result.samples) ? result.samples.map((item) => ({ ...item })) : [],
+    recallCounts: result.recallCounts ? { ...result.recallCounts } : {},
+  };
+};
+
+const getCachedRecall = (signature) => {
+  const cached = recallCache.get(signature);
+  if (!cached) return null;
+  if (Date.now() - cached.ts > RECALL_CACHE_TTL_MS) {
+    recallCache.delete(signature);
+    return null;
+  }
+  return cloneRecallResult(cached.result);
+};
+
+const setCachedRecall = (signature, result) => {
+  if (!signature || !result?.candidates?.length) return;
+  recallCache.set(signature, {
+    ts: Date.now(),
+    result: cloneRecallResult(result),
+  });
+};
+
 const mergeCandidate = (candidateMap, poi, context) => {
   const id = Number(poi?.id);
   if (!id) return;
@@ -271,6 +333,33 @@ export const recallCandidates = async ({
   perSampleLimit = 18,
   radiusOverride = null,
 }) => {
+  const signature = buildRecallSignature({
+    route,
+    modeConfig,
+    userProfile,
+    category,
+    candidateLimit,
+    perSampleLimit,
+    radiusOverride,
+  });
+
+  const cached = getCachedRecall(signature);
+  if (cached) {
+    return {
+      ...cached,
+      cached: true,
+    };
+  }
+
+  if (inflightRecallMap.has(signature)) {
+    const pending = await inflightRecallMap.get(signature);
+    return {
+      ...cloneRecallResult(pending),
+      shared: true,
+    };
+  }
+
+  const requestPromise = (async () => {
   const coords = route?.geometry?.coordinates || [];
   const routeDistance = Number(route?.distance) || 0;
 
@@ -382,11 +471,21 @@ export const recallCandidates = async ({
     };
   });
 
-  return {
-    candidates,
-    samples,
-    sampleStepM,
-    radiusM,
-    recallCounts,
-  };
+    const result = {
+      candidates,
+      samples,
+      sampleStepM,
+      radiusM,
+      recallCounts,
+    };
+    setCachedRecall(signature, result);
+    return result;
+  })();
+
+  inflightRecallMap.set(signature, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    inflightRecallMap.delete(signature);
+  }
 };
