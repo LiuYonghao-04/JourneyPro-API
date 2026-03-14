@@ -13,6 +13,7 @@ const CFG = {
   resetTables: String(process.env.SOCIAL_RESET_TABLES || "0") === "1",
   syncCounters: String(process.env.SOCIAL_SYNC_COUNTERS || "1") === "1",
   postLimit: Math.max(0, Number(process.env.SOCIAL_POST_LIMIT || 220000)),
+  postStartId: Math.max(0, Number(process.env.SOCIAL_POST_START_ID || 0)),
   postBatch: Math.max(200, Math.min(5000, Number(process.env.SOCIAL_POST_BATCH || 1200))),
   eventInsertBatch: Math.max(500, Math.min(8000, Number(process.env.SOCIAL_EVENT_INSERT_BATCH || 3500))),
   followInsertBatch: Math.max(200, Math.min(6000, Number(process.env.SOCIAL_FOLLOW_INSERT_BATCH || 2000))),
@@ -24,6 +25,8 @@ const CFG = {
   followMax: Math.max(2, Number(process.env.SOCIAL_FOLLOW_MAX || 120)),
   eventLookbackDays: Math.max(1, Number(process.env.SOCIAL_EVENT_LOOKBACK_DAYS || 45)),
   recentBoostHours: Math.max(1, Number(process.env.SOCIAL_RECENT_BOOST_HOURS || 24)),
+  weightPostWindow: Math.max(5000, Number(process.env.SOCIAL_WEIGHT_POST_WINDOW || 60000)),
+  skipFollows: String(process.env.SOCIAL_SKIP_FOLLOWS || "0") === "1",
 };
 
 const NOW = Date.now();
@@ -31,6 +34,31 @@ const DAY_MS = 24 * 3600 * 1000;
 
 const normalize = (value) => String(value || "").trim();
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+const qTable = (value) => `\`${String(value || "").replace(/`/g, "``")}\``;
+const tableExists = async (conn, tableName) => {
+  const [rows] = await conn.query(
+    `
+      SELECT 1 AS hit
+      FROM information_schema.tables
+      WHERE table_schema = DATABASE()
+        AND table_name = ?
+      LIMIT 1
+    `,
+    [tableName]
+  );
+  return !!rows.length;
+};
+
+const TABLES = {
+  likes: normalize(process.env.SOCIAL_LIKES_TABLE) || "post_likes",
+  favorites: normalize(process.env.SOCIAL_FAVORITES_TABLE) || "post_favorites",
+  follows: normalize(process.env.SOCIAL_FOLLOWS_TABLE) || "user_follows",
+  posts: normalize(process.env.SOCIAL_POSTS_TABLE) || "posts",
+  users: normalize(process.env.SOCIAL_USERS_TABLE) || "users",
+};
+
+const USING_CUSTOM_INTERACTION_TABLES =
+  TABLES.likes !== "post_likes" || TABLES.favorites !== "post_favorites" || TABLES.follows !== "user_follows";
 
 const stableHash = (input) => {
   const text = normalize(input);
@@ -48,64 +76,143 @@ const toTs = (value) => {
   return ts;
 };
 
+function buildUserTierProfile(userId, userWeight = 1) {
+  const pct = stableHash(`tier:${userId}`) % 100;
+  const momentum = clamp(0.92 + Math.log1p(Number(userWeight) || 1) * 0.34, 0.92, 1.75);
+  if (pct < 8) {
+    return {
+      label: "anchor",
+      attraction: 1.8 * momentum,
+      reactionBias: 1.35 * momentum,
+      followMinFactor: 0.72,
+      followMaxFactor: 1,
+    };
+  }
+  if (pct < 24) {
+    return {
+      label: "rising",
+      attraction: 1.38 * momentum,
+      reactionBias: 1.12 * momentum,
+      followMinFactor: 0.48,
+      followMaxFactor: 0.82,
+    };
+  }
+  if (pct < 67) {
+    return {
+      label: "steady",
+      attraction: 1.02 * momentum,
+      reactionBias: 0.96 * momentum,
+      followMinFactor: 0.24,
+      followMaxFactor: 0.58,
+    };
+  }
+  return {
+    label: "quiet",
+    attraction: 0.72 * momentum,
+    reactionBias: 0.68 * momentum,
+    followMinFactor: 0.08,
+    followMaxFactor: 0.26,
+  };
+}
+
 async function tryAlter(conn, sql) {
   try {
     await conn.query(sql);
   } catch (err) {
     const msg = String(err?.message || err);
-    if (!msg.includes("Duplicate key") && !msg.includes("check that column/key exists")) {
+    if (
+      !msg.includes("Duplicate key") &&
+      !msg.includes("Duplicate column name") &&
+      !msg.includes("check that column/key exists")
+    ) {
       console.error("alter failed:", msg);
     }
   }
 }
 
 async function ensureTables(conn) {
-  await conn.query(`
-    CREATE TABLE IF NOT EXISTS post_likes (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      post_id BIGINT NOT NULL,
-      user_id BIGINT NOT NULL,
-      post_owner_id BIGINT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uk_post_user_like (post_id, user_id)
-    );
-  `);
-  await conn.query(`
-    CREATE TABLE IF NOT EXISTS post_favorites (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      post_id BIGINT NOT NULL,
-      user_id BIGINT NOT NULL,
-      post_owner_id BIGINT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uk_post_user_fav (post_id, user_id)
-    );
-  `);
-  await conn.query(`
-    CREATE TABLE IF NOT EXISTS user_follows (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      follower_id BIGINT NOT NULL,
-      following_id BIGINT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      status VARCHAR(20) DEFAULT 'NORMAL',
-      UNIQUE KEY uk_follows_pair (follower_id, following_id)
-    );
-  `);
+  if (USING_CUSTOM_INTERACTION_TABLES) {
+    if (!(await tableExists(conn, TABLES.likes))) {
+      await conn.query(`CREATE TABLE ${qTable(TABLES.likes)} LIKE ${qTable("post_likes")}`);
+    }
+    if (!(await tableExists(conn, TABLES.favorites))) {
+      await conn.query(`CREATE TABLE ${qTable(TABLES.favorites)} LIKE ${qTable("post_favorites")}`);
+    }
+    if (!(await tableExists(conn, TABLES.follows))) {
+      await conn.query(`CREATE TABLE ${qTable(TABLES.follows)} LIKE ${qTable("user_follows")}`);
+    }
+  } else {
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS post_likes (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        post_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        post_owner_id BIGINT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_post_user_like (post_id, user_id)
+      );
+    `);
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS post_favorites (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        post_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        post_owner_id BIGINT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_post_user_fav (post_id, user_id)
+      );
+    `);
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS user_follows (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        follower_id BIGINT NOT NULL,
+        following_id BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status VARCHAR(20) DEFAULT 'NORMAL',
+        UNIQUE KEY uk_follows_pair (follower_id, following_id)
+      );
+    `);
+  }
 
-  await tryAlter(conn, `ALTER TABLE post_likes ADD COLUMN post_owner_id BIGINT NULL`);
-  await tryAlter(conn, `ALTER TABLE post_favorites ADD COLUMN post_owner_id BIGINT NULL`);
-  await tryAlter(conn, `ALTER TABLE post_likes ADD INDEX idx_post_likes_created (created_at, post_id, user_id)`);
-  await tryAlter(conn, `ALTER TABLE post_likes ADD INDEX idx_post_likes_user_created (user_id, created_at, post_id)`);
-  await tryAlter(conn, `ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
-  await tryAlter(conn, `ALTER TABLE post_favorites ADD INDEX idx_post_fav_created (created_at, post_id, user_id)`);
-  await tryAlter(conn, `ALTER TABLE post_favorites ADD INDEX idx_post_fav_user_created (user_id, created_at, post_id)`);
-  await tryAlter(conn, `ALTER TABLE post_favorites ADD INDEX idx_post_fav_owner_created (post_owner_id, created_at, post_id, user_id)`);
-  await tryAlter(conn, `ALTER TABLE user_follows ADD INDEX idx_follows_following_created (following_id, created_at, follower_id)`);
-  await tryAlter(conn, `ALTER TABLE user_follows ADD INDEX idx_follows_follower_created (follower_id, created_at, following_id)`);
-  await tryAlter(conn, `ALTER TABLE posts ADD INDEX idx_posts_user_id (user_id, id)`);
+  await tryAlter(conn, `ALTER TABLE ${qTable(TABLES.likes)} ADD COLUMN post_owner_id BIGINT NULL`);
+  await tryAlter(conn, `ALTER TABLE ${qTable(TABLES.favorites)} ADD COLUMN post_owner_id BIGINT NULL`);
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.likes)} ADD INDEX idx_post_likes_created (created_at, post_id, user_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.likes)} ADD INDEX idx_post_likes_user_created (user_id, created_at, post_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.likes)} ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.favorites)} ADD INDEX idx_post_fav_created (created_at, post_id, user_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.favorites)} ADD INDEX idx_post_fav_user_created (user_id, created_at, post_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.favorites)} ADD INDEX idx_post_fav_owner_created (post_owner_id, created_at, post_id, user_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.follows)} ADD INDEX idx_follows_following_created (following_id, created_at, follower_id)`
+  );
+  await tryAlter(
+    conn,
+    `ALTER TABLE ${qTable(TABLES.follows)} ADD INDEX idx_follows_follower_created (follower_id, created_at, following_id)`
+  );
+  await tryAlter(conn, `ALTER TABLE ${qTable(TABLES.posts)} ADD INDEX idx_posts_user_id (user_id, id)`);
 }
 
 async function ensureUsers(conn) {
-  const [existing] = await conn.query(`SELECT id, username FROM users ORDER BY id ASC`);
+  const [existing] = await conn.query(`SELECT id, username FROM ${qTable(TABLES.users)} ORDER BY id ASC`);
   const ids = existing.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
   if (ids.length >= CFG.targetUsers) return ids;
 
@@ -133,13 +240,13 @@ async function ensureUsers(conn) {
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
       await conn.query(
-        `INSERT INTO users (username, password_hash, nickname, avatar_url) VALUES ?`,
+        `INSERT INTO ${qTable(TABLES.users)} (username, password_hash, nickname, avatar_url) VALUES ?`,
         [chunk]
       );
     }
   }
 
-  const [after] = await conn.query(`SELECT id FROM users ORDER BY id ASC`);
+  const [after] = await conn.query(`SELECT id FROM ${qTable(TABLES.users)} ORDER BY id ASC`);
   return after.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
 }
 
@@ -179,25 +286,76 @@ function pickDistinctUsers(userIds, authorId, count, seedText) {
   return selected;
 }
 
-function computeLikeTarget(post, maxPerPost) {
+function buildReactionUserPool(userIds, userWeights) {
+  const pool = [];
+  (userIds || []).forEach((uid) => {
+    const tier = buildUserTierProfile(uid, userWeights.get(uid) || 1);
+    const repeatBase =
+      tier.label === "anchor" ? 6 : tier.label === "rising" ? 4 : tier.label === "steady" ? 2 : 1;
+    const extra = Math.max(0, Math.min(3, Math.round((userWeights.get(uid) || 1) / 4)));
+    const repeat = repeatBase + extra;
+    for (let i = 0; i < repeat; i += 1) {
+      pool.push(uid);
+    }
+  });
+  return pool.length ? pool : [...(userIds || [])];
+}
+
+function pickDistinctUsersFromPool(pool, fallbackUserIds, authorId, count, seedText) {
+  const seed = stableHash(seedText);
+  const source = Array.isArray(pool) && pool.length ? pool : fallbackUserIds;
+  const total = source.length;
+  const fallbackTotal = fallbackUserIds.length;
+  if (count <= 0 || fallbackTotal <= 1 || total <= 0) return [];
+  const maxCount = Math.min(count, fallbackTotal - 1);
+  const selected = [];
+  const seen = new Set();
+  const stepRaw = (seed % Math.max(total - 1, 1)) + 1;
+  const step = stepRaw % 2 === 0 ? stepRaw + 1 : stepRaw;
+  let idx = seed % total;
+  let guard = 0;
+  const maxGuard = total * 6;
+  while (selected.length < maxCount && guard < maxGuard) {
+    const uid = source[idx % total];
+    if (uid !== authorId && !seen.has(uid)) {
+      seen.add(uid);
+      selected.push(uid);
+    }
+    idx += step;
+    guard += 1;
+  }
+  if (selected.length >= maxCount) return selected;
+  const remainder = pickDistinctUsers(fallbackUserIds, authorId, maxCount - selected.length, `${seedText}:fallback`);
+  remainder.forEach((uid) => {
+    if (uid !== authorId && !seen.has(uid) && selected.length < maxCount) {
+      seen.add(uid);
+      selected.push(uid);
+    }
+  });
+  return selected;
+}
+
+function computeLikeTarget(post, maxPerPost, authorBias = 1) {
   const like = Number(post.like_count) || 0;
   const fav = Number(post.favorite_count) || 0;
   const view = Number(post.view_count) || 0;
-  const signal = like * 0.55 + fav * 0.8 + view * 0.02;
+  const signal = like * 2.2 + fav * 3.1 + Math.pow(Math.max(view, 0), 0.64) * 0.78;
   if (signal <= 0) return 0;
-  const base = Math.round(1 + Math.log1p(signal) * 1.25);
-  const jitter = (stableHash(`lk:${post.id}`) % 3) - 1;
+  const scaledSignal = signal * Math.max(0.5, Number(authorBias) || 1);
+  const burst = stableHash(`lk:burst:${post.id}`) % 100 < 8 ? 1.35 : 1;
+  const base = Math.round(Math.pow(Math.log1p(scaledSignal), 1.72) * burst - 1.2);
+  const jitter = (stableHash(`lk:${post.id}`) % 7) - 3;
   const maxAllowed = Math.min(maxPerPost, CFG.likeMax);
   return clamp(base + jitter, CFG.likeMin, maxAllowed);
 }
 
-function computeFavTarget(post, likeTarget, maxPerPost) {
+function computeFavTarget(post, likeTarget, maxPerPost, authorBias = 1) {
   if (likeTarget <= 0) return 0;
   const fav = Number(post.favorite_count) || 0;
   const view = Number(post.view_count) || 0;
-  const signal = fav * 0.9 + view * 0.01;
-  const base = Math.round(Math.max(0, likeTarget * 0.56) + Math.log1p(signal) * 0.45);
-  const jitter = (stableHash(`fv:${post.id}`) % 3) - 1;
+  const signal = (fav * 2 + Math.pow(Math.max(view, 0), 0.55) * 0.34) * Math.max(0.5, Number(authorBias) || 1);
+  const base = Math.round(Math.max(0, likeTarget * 0.34) + Math.pow(Math.log1p(signal), 1.36) - 1);
+  const jitter = (stableHash(`fv:${post.id}`) % 5) - 2;
   const maxAllowed = Math.min(maxPerPost, likeTarget, CFG.favMax);
   return clamp(base + jitter, CFG.favMin, maxAllowed);
 }
@@ -205,25 +363,46 @@ function computeFavTarget(post, likeTarget, maxPerPost) {
 async function maybeResetTables(conn) {
   if (!CFG.resetTables) return;
   console.log("resetting post_likes / post_favorites / user_follows ...");
-  await conn.query(`DELETE FROM post_likes`);
-  await conn.query(`DELETE FROM post_favorites`);
-  await conn.query(`DELETE FROM user_follows`);
+  try {
+    await conn.query(`SET FOREIGN_KEY_CHECKS = 0`);
+    await conn.query(`TRUNCATE TABLE ${qTable(TABLES.likes)}`);
+    await conn.query(`TRUNCATE TABLE ${qTable(TABLES.favorites)}`);
+    await conn.query(`TRUNCATE TABLE ${qTable(TABLES.follows)}`);
+    await conn.query(`SET FOREIGN_KEY_CHECKS = 1`);
+  } catch (err) {
+    await conn.query(`SET FOREIGN_KEY_CHECKS = 1`);
+    console.warn("truncate reset failed, falling back to delete:", err?.message || err);
+    await conn.query(`DELETE FROM ${qTable(TABLES.likes)}`);
+    await conn.query(`DELETE FROM ${qTable(TABLES.favorites)}`);
+    await conn.query(`DELETE FROM ${qTable(TABLES.follows)}`);
+  }
 }
 
-async function fetchUserWeights(conn) {
-  const [rows] = await conn.query(`
-    SELECT
-      u.id,
-      COALESCE(s.post_cnt, 0) AS post_cnt,
-      COALESCE(s.avg_view, 0) AS avg_view
-    FROM users u
-    LEFT JOIN (
-      SELECT user_id, COUNT(*) AS post_cnt, AVG(view_count) AS avg_view
-      FROM posts
-      GROUP BY user_id
-    ) s ON s.user_id = u.id
-    ORDER BY u.id ASC
-  `);
+async function fetchUserWeights(conn, userIds) {
+  const ids = [...new Set((userIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  const userFilter = ids.length ? `WHERE u.id IN (?)` : "";
+  const [[maxRow]] = await conn.query(`SELECT COALESCE(MAX(id), 0) AS max_id FROM ${qTable(TABLES.posts)}`);
+  const maxId = Number(maxRow?.max_id || 0);
+  const minId = Math.max(0, maxId - CFG.weightPostWindow);
+  const params = ids.length ? [minId, ids] : [minId];
+  const [rows] = await conn.query(
+    `
+      SELECT
+        u.id,
+        COALESCE(s.post_cnt, 0) AS post_cnt,
+        COALESCE(s.avg_view, 0) AS avg_view
+      FROM ${qTable(TABLES.users)} u
+      LEFT JOIN (
+        SELECT user_id, COUNT(*) AS post_cnt, AVG(view_count) AS avg_view
+        FROM ${qTable(TABLES.posts)}
+        WHERE id >= ?
+        GROUP BY user_id
+      ) s ON s.user_id = u.id
+      ${userFilter}
+      ORDER BY u.id ASC
+    `,
+    params
+  );
   const map = new Map();
   rows.forEach((row) => {
     const id = Number(row.id);
@@ -247,7 +426,7 @@ async function seedFollowGraph(conn, userIds, userWeights) {
   const flush = async () => {
     if (!followRows.length) return;
     const [res] = await conn.query(
-      `INSERT IGNORE INTO user_follows (follower_id, following_id, created_at) VALUES ?`,
+      `INSERT IGNORE INTO ${qTable(TABLES.follows)} (follower_id, following_id, created_at) VALUES ?`,
       [followRows]
     );
     inserted += Number(res?.affectedRows || 0);
@@ -256,13 +435,18 @@ async function seedFollowGraph(conn, userIds, userWeights) {
 
   for (let i = 0; i < userIds.length; i += 1) {
     const followerId = userIds[i];
-    const targetCount = minFollow + (stableHash(`fc:${followerId}`) % (maxFollow - minFollow + 1));
+    const followerWeight = userWeights.get(followerId) || 1;
+    const followerTier = buildUserTierProfile(followerId, followerWeight);
+    const localMin = clamp(Math.round(minFollow * followerTier.followMinFactor), 1, maxFollow);
+    const localMax = clamp(Math.round(maxFollow * followerTier.followMaxFactor), localMin, maxFollow);
+    const targetCount = localMin + (stableHash(`fc:${followerId}`) % (localMax - localMin + 1));
     const ranked = userIds
       .filter((uid) => uid !== followerId)
       .map((uid) => {
         const base = userWeights.get(uid) || 1;
+        const targetTier = buildUserTierProfile(uid, base);
         const jitter = 0.68 + ((stableHash(`fw:${followerId}:${uid}`) % 1000) / 1000) * 0.7;
-        return { uid, score: base * jitter };
+        return { uid, score: base * targetTier.attraction * jitter };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, targetCount);
@@ -291,16 +475,16 @@ async function syncPostCounters(conn, postIds) {
   if (!ids.length) return;
   await conn.query(
     `
-      UPDATE posts p
+      UPDATE ${qTable(TABLES.posts)} p
       LEFT JOIN (
         SELECT post_id, COUNT(*) AS cnt
-        FROM post_likes
+        FROM ${qTable(TABLES.likes)}
         WHERE post_id IN (?)
         GROUP BY post_id
       ) l ON l.post_id = p.id
       LEFT JOIN (
         SELECT post_id, COUNT(*) AS cnt
-        FROM post_favorites
+        FROM ${qTable(TABLES.favorites)}
         WHERE post_id IN (?)
         GROUP BY post_id
       ) f ON f.post_id = p.id
@@ -313,8 +497,8 @@ async function syncPostCounters(conn, postIds) {
   );
 }
 
-async function seedReactions(conn, userIds) {
-  let cursorId = 0;
+async function seedReactions(conn, userIds, userWeights) {
+  let cursorId = CFG.postStartId;
   let processed = 0;
   let totalLikesPlanned = 0;
   let totalFavsPlanned = 0;
@@ -324,6 +508,7 @@ async function seedReactions(conn, userIds) {
   if (maxPerPost <= 0) {
     return { processed: 0, likes_planned: 0, favorites_planned: 0, likes_inserted: 0, favorites_inserted: 0 };
   }
+  const reactionUserPool = buildReactionUserPool(userIds, userWeights);
 
   const likeRows = [];
   const favRows = [];
@@ -331,7 +516,7 @@ async function seedReactions(conn, userIds) {
   const flushLikeRows = async () => {
     if (!likeRows.length) return;
     const [res] = await conn.query(
-      `INSERT IGNORE INTO post_likes (post_id, user_id, post_owner_id, created_at) VALUES ?`,
+      `INSERT IGNORE INTO ${qTable(TABLES.likes)} (post_id, user_id, post_owner_id, created_at) VALUES ?`,
       [likeRows]
     );
     totalLikesInserted += Number(res?.affectedRows || 0);
@@ -341,7 +526,7 @@ async function seedReactions(conn, userIds) {
   const flushFavRows = async () => {
     if (!favRows.length) return;
     const [res] = await conn.query(
-      `INSERT IGNORE INTO post_favorites (post_id, user_id, post_owner_id, created_at) VALUES ?`,
+      `INSERT IGNORE INTO ${qTable(TABLES.favorites)} (post_id, user_id, post_owner_id, created_at) VALUES ?`,
       [favRows]
     );
     totalFavsInserted += Number(res?.affectedRows || 0);
@@ -352,10 +537,10 @@ async function seedReactions(conn, userIds) {
     const remain = CFG.postLimit > 0 ? CFG.postLimit - processed : CFG.postBatch;
     if (CFG.postLimit > 0 && remain <= 0) break;
     const qLimit = CFG.postLimit > 0 ? Math.min(CFG.postBatch, remain) : CFG.postBatch;
-    const [rows] = await conn.query(
+      const [rows] = await conn.query(
       `
         SELECT id, user_id, created_at, like_count, favorite_count, view_count
-        FROM posts
+        FROM ${qTable(TABLES.posts)}
         WHERE id > ?
         ORDER BY id ASC
         LIMIT ?
@@ -373,10 +558,11 @@ async function seedReactions(conn, userIds) {
       if (!Number.isFinite(postId) || !Number.isFinite(authorId)) continue;
       chunkPostIds.push(postId);
 
-      const likeTarget = computeLikeTarget(post, maxPerPost);
-      const favTarget = computeFavTarget(post, likeTarget, maxPerPost);
-      const likeUsers = pickDistinctUsers(userIds, authorId, likeTarget, `lk:${postId}`);
-      const favUsers = pickDistinctUsers(userIds, authorId, favTarget, `fv:${postId}`);
+      const authorBias = buildUserTierProfile(authorId, userWeights.get(authorId) || 1).attraction;
+      const likeTarget = computeLikeTarget(post, maxPerPost, authorBias);
+      const favTarget = computeFavTarget(post, likeTarget, maxPerPost, authorBias);
+      const likeUsers = pickDistinctUsersFromPool(reactionUserPool, userIds, authorId, likeTarget, `lk:${postId}`);
+      const favUsers = pickDistinctUsersFromPool(reactionUserPool, userIds, authorId, favTarget, `fv:${postId}`);
 
       totalLikesPlanned += likeUsers.length;
       totalFavsPlanned += favUsers.length;
@@ -426,13 +612,13 @@ async function seedReactions(conn, userIds) {
 
 async function fetchSummary(conn) {
   const queries = {
-    users: `SELECT COUNT(*) AS c FROM users`,
-    posts: `SELECT COUNT(*) AS c FROM posts`,
-    likes_table: `SELECT COUNT(*) AS c FROM post_likes`,
-    favorites_table: `SELECT COUNT(*) AS c FROM post_favorites`,
-    follows_table: `SELECT COUNT(*) AS c FROM user_follows`,
-    post_like_sum: `SELECT COALESCE(SUM(like_count), 0) AS c FROM posts`,
-    post_fav_sum: `SELECT COALESCE(SUM(favorite_count), 0) AS c FROM posts`,
+    users: `SELECT COUNT(*) AS c FROM ${qTable(TABLES.users)}`,
+    posts: `SELECT COUNT(*) AS c FROM ${qTable(TABLES.posts)}`,
+    likes_table: `SELECT COUNT(*) AS c FROM ${qTable(TABLES.likes)}`,
+    favorites_table: `SELECT COUNT(*) AS c FROM ${qTable(TABLES.favorites)}`,
+    follows_table: `SELECT COUNT(*) AS c FROM ${qTable(TABLES.follows)}`,
+    post_like_sum: `SELECT COALESCE(SUM(like_count), 0) AS c FROM ${qTable(TABLES.posts)}`,
+    post_fav_sum: `SELECT COALESCE(SUM(favorite_count), 0) AS c FROM ${qTable(TABLES.posts)}`,
   };
   const out = {};
   for (const [key, sql] of Object.entries(queries)) {
@@ -451,9 +637,11 @@ async function main() {
     const before = await fetchSummary(conn);
     const userIds = await ensureUsers(conn);
     await maybeResetTables(conn);
-    const userWeights = await fetchUserWeights(conn);
-    const followResult = await seedFollowGraph(conn, userIds, userWeights);
-    const reactionResult = await seedReactions(conn, userIds);
+    const userWeights = await fetchUserWeights(conn, userIds);
+    const followResult = CFG.skipFollows
+      ? { inserted: 0, planned: 0, skipped: true }
+      : await seedFollowGraph(conn, userIds, userWeights);
+    const reactionResult = await seedReactions(conn, userIds, userWeights);
     const after = await fetchSummary(conn);
 
     console.log(
@@ -461,6 +649,7 @@ async function main() {
         {
           success: true,
           config: CFG,
+          tables: TABLES,
           before,
           follow_seed: followResult,
           reaction_seed: reactionResult,

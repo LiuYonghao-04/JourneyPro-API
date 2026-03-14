@@ -9,10 +9,159 @@ let schemaMigrationNoticePrinted = false;
 
 let ensurePoiSchemaPromise = null;
 const poiPhotoFillInFlight = new Map();
+const parkingNearbyCache = new Map();
 
 const normalize = (value) => String(value || "").trim();
 const isHttpUrl = (value) => /^https?:\/\//i.test(normalize(value));
 const unique = (items) => [...new Set((items || []).map((item) => normalize(item)).filter(Boolean))];
+const EARTH_RADIUS_M = 6371000;
+const PARKING_RADIUS_STEPS = [500, 1000];
+
+const toRadians = (value) => (Number(value) * Math.PI) / 180;
+const roundCoord = (value) => Number(Number(value || 0).toFixed(4));
+
+const haversineMeters = (lat1, lng1, lat2, lng2) => {
+  const dLat = toRadians(lat2 - lat1);
+  const dLng = toRadians(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(a));
+};
+
+const buildParkingCacheKey = (lat, lng, radius, limit) =>
+  `${roundCoord(lat)}:${roundCoord(lng)}:${Number(radius) || 0}:${Number(limit) || 0}`;
+
+const formatParkingAddress = (tags = {}) => {
+  const parts = [
+    [tags["addr:housenumber"], tags["addr:street"]].filter(Boolean).join(" ").trim(),
+    tags["addr:city"],
+    tags["addr:postcode"],
+  ]
+    .map((item) => normalize(item))
+    .filter(Boolean);
+  return parts.join(", ");
+};
+
+const dedupeParkingItems = (items) => {
+  const seen = new Set();
+  return (items || []).filter((item) => {
+    const key = `${item?.source || "x"}:${item?.osm_type || item?.id || ""}:${roundCoord(item?.lat)}:${roundCoord(item?.lng)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const fetchLocalParking = async (lat, lng, radius, limit = 8) => {
+  const latDelta = radius / 111320;
+  const lngDelta = radius / (111320 * Math.max(Math.cos(toRadians(lat)), 0.2));
+  const [rows] = await pool.query(
+    `
+      SELECT
+        id,
+        name,
+        category,
+        lat,
+        lng,
+        address,
+        city,
+        image_url,
+        (
+          6371000 * 2 * ASIN(
+            SQRT(
+              POWER(SIN(RADIANS(lat - ?) / 2), 2) +
+              COS(RADIANS(?)) * COS(RADIANS(lat)) * POWER(SIN(RADIANS(lng - ?) / 2), 2)
+            )
+          )
+        ) AS distance_m
+      FROM poi
+      WHERE
+        lat BETWEEN ? AND ?
+        AND lng BETWEEN ? AND ?
+        AND (
+          LOWER(COALESCE(category, '')) LIKE '%parking%'
+          OR LOWER(COALESCE(tags, '')) LIKE '%parking%'
+          OR LOWER(COALESCE(name, '')) LIKE '%parking%'
+        )
+      HAVING distance_m <= ?
+      ORDER BY distance_m ASC, id ASC
+      LIMIT ?
+    `,
+    [lat, lat, lng, lat - latDelta, lat + latDelta, lng - lngDelta, lng + lngDelta, radius, limit]
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name || "Parking",
+    category: row.category || "parking",
+    lat: Number(row.lat),
+    lng: Number(row.lng),
+    address: row.address || row.city || "",
+    image_url: row.image_url || null,
+    distance_m: Math.round(Number(row.distance_m) || 0),
+    source: "local_poi",
+  }));
+};
+
+const fetchOsmParking = async (lat, lng, radius, limit = 8) => {
+  const cacheKey = buildParkingCacheKey(lat, lng, radius, limit);
+  const cached = parkingNearbyCache.get(cacheKey);
+  if (cached && cached.expires_at > Date.now()) {
+    return cached.items;
+  }
+
+  const query = `[out:json][timeout:12];
+(
+  node["amenity"="parking"](around:${Math.round(radius)},${lat},${lng});
+  way["amenity"="parking"](around:${Math.round(radius)},${lat},${lng});
+  relation["amenity"="parking"](around:${Math.round(radius)},${lat},${lng});
+);
+out center tags;`;
+
+  const res = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain;charset=UTF-8",
+      Accept: "application/json",
+    },
+    body: query,
+  });
+  if (!res.ok) {
+    throw new Error(`overpass ${res.status}`);
+  }
+
+  const data = await res.json();
+  const items = dedupeParkingItems(
+    (data?.elements || [])
+      .map((item) => {
+        const itemLat = Number(item?.lat ?? item?.center?.lat);
+        const itemLng = Number(item?.lon ?? item?.center?.lon);
+        if (!Number.isFinite(itemLat) || !Number.isFinite(itemLng)) return null;
+        return {
+          id: item?.id || null,
+          osm_type: item?.type || "node",
+          name: item?.tags?.name || item?.tags?.operator || "Parking",
+          category: "parking",
+          lat: itemLat,
+          lng: itemLng,
+          address: formatParkingAddress(item?.tags || {}),
+          capacity: item?.tags?.capacity || null,
+          distance_m: Math.round(haversineMeters(lat, lng, itemLat, itemLng)),
+          source: "osm_overpass",
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance_m - b.distance_m)
+      .slice(0, limit)
+  );
+
+  parkingNearbyCache.set(cacheKey, {
+    expires_at: Date.now() + 10 * 60 * 1000,
+    items,
+  });
+  return items;
+};
 
 const isBenignAlterError = (err) => {
   const msg = String(err?.message || err || "");
@@ -199,6 +348,57 @@ router.get("/nearby", async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error("poi nearby error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.get("/parking-nearby", async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=120");
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit || "8", 10) || 8, 12));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ success: false, message: "lat/lng required" });
+    }
+
+    for (const radius of PARKING_RADIUS_STEPS) {
+      const localItems = await fetchLocalParking(lat, lng, radius, limit);
+      let items = localItems;
+      if (items.length < limit) {
+        try {
+          const osmItems = await fetchOsmParking(lat, lng, radius, limit);
+          items = dedupeParkingItems([...localItems, ...osmItems]).sort(
+            (a, b) => Number(a.distance_m || 0) - Number(b.distance_m || 0)
+          );
+        } catch (err) {
+          console.warn("parking overpass fallback failed:", err?.message || err);
+        }
+      }
+      if (items.length) {
+        return res.json({
+          success: true,
+          data: {
+            found: true,
+            searched_radius_m: radius,
+            expanded: radius > PARKING_RADIUS_STEPS[0],
+            items: items.slice(0, limit),
+          },
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        found: false,
+        searched_radius_m: PARKING_RADIUS_STEPS[PARKING_RADIUS_STEPS.length - 1],
+        expanded: true,
+        items: [],
+      },
+    });
+  } catch (err) {
+    console.error("parking nearby error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });

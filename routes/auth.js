@@ -2,6 +2,7 @@ import express from "express";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { pool } from "../db/connect.js";
+import { appendAdminFlag } from "../utils/admin.js";
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "journeypro-secret";
@@ -63,7 +64,7 @@ router.post("/register", async (req, res) => {
       [username, hash, nickname, finalAvatar]
     );
 
-    const newUser = { id: result.insertId, username, nickname, avatar_url: finalAvatar };
+    const newUser = appendAdminFlag({ id: result.insertId, username, nickname, avatar_url: finalAvatar });
     const token = jwt.sign({ uid: newUser.id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ success: true, token, user: newUser });
   } catch (err) {
@@ -90,7 +91,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ success: false, message: "invalid credentials" });
     }
 
-    const user = mapUser(userRow);
+    const user = appendAdminFlag(mapUser(userRow));
     const token = jwt.sign({ uid: user.id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ success: true, token, user });
   } catch (err) {
@@ -110,7 +111,7 @@ router.get("/user", async (req, res) => {
     if (!rows.length) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
-    res.json({ success: true, user: mapUser(rows[0]) });
+    res.json({ success: true, user: appendAdminFlag(mapUser(rows[0])) });
   } catch (err) {
     console.error("fetch user error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -128,7 +129,7 @@ router.post("/avatar", async (req, res) => {
     await pool.query("UPDATE users SET avatar_url = ? WHERE id = ?", [avatar_url, uid]);
     const [rows] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [uid]);
     if (!rows.length) return res.status(404).json({ success: false, message: "user not found" });
-    res.json({ success: true, user: mapUser(rows[0]) });
+    res.json({ success: true, user: appendAdminFlag(mapUser(rows[0])) });
   } catch (err) {
     console.error("update avatar error", err);
     res.status(500).json({ success: false, message: "server error" });

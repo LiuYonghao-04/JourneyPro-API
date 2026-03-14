@@ -337,6 +337,34 @@ async function fetchCommentWithUser(commentId) {
   return archiveRows?.[0] || null;
 }
 
+async function fetchCommentRecord(commentId) {
+  const [hotRows] = await pool.query(`SELECT *, 'hot' AS _source FROM post_comments WHERE id = ? LIMIT 1`, [commentId]);
+  if (hotRows?.length) return hotRows[0];
+  const [archiveRows] = await pool.query(
+    `SELECT *, 'archive' AS _source FROM post_comments_archive WHERE id = ? LIMIT 1`,
+    [commentId]
+  );
+  return archiveRows?.[0] || null;
+}
+
+async function deleteCommentRecord(comment) {
+  if (!comment?.id) return;
+  const table = comment._source === "archive" ? "post_comments_archive" : "post_comments";
+  await pool.query(`DELETE FROM ${table} WHERE id = ? LIMIT 1`, [comment.id]);
+}
+
+async function markCommentDeleted(commentId) {
+  const placeholder = "Comment deleted by author.";
+  await pool.query(
+    `
+      UPDATE post_comments
+      SET content = ?, status = 'DELETED', like_count = 0, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `,
+    [placeholder, commentId]
+  );
+}
+
 async function ensureCommentInHotTable(commentId) {
   const [[hot]] = await pool.query(`SELECT id FROM post_comments WHERE id = ? LIMIT 1`, [commentId]);
   if (hot?.id) return true;
@@ -1050,8 +1078,10 @@ router.get("/:id/comments", async (req, res) => {
         post_id: r.post_id,
         user_id: r.user_id,
         parent_id: parentId,
-        content: r.content,
+        content: String(r.status || "").toUpperCase() === "DELETED" ? "Comment deleted by author." : r.content,
         like_count: r.like_count || 0,
+        status: r.status || "NORMAL",
+        is_deleted: String(r.status || "").toUpperCase() === "DELETED",
         created_at: r.created_at,
         liked_by_user: !!r.liked_by_user,
         user: { id: r.user_id, nickname: r.nickname || "旅人", avatar_url: r.avatar_url || null },
@@ -1174,6 +1204,69 @@ router.post("/comments/:cid/like", async (req, res) => {
     res.json({ success: true, data, liked: !existing });
   } catch (err) {
     console.error("like comment error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.delete("/comments/:cid", async (req, res) => {
+  try {
+    await ensureTablesReady();
+    const cid = parseInt(req.params.cid, 10);
+    const userId = parseInt(req.body?.user_id || req.query?.user_id || "0", 10);
+    if (!cid || !userId) {
+      return res.status(400).json({ success: false, message: "comment id and user_id required" });
+    }
+
+    let record = await fetchCommentRecord(cid);
+    if (!record) {
+      return res.status(404).json({ success: false, message: "comment not found" });
+    }
+    if (Number(record.user_id) !== Number(userId)) {
+      return res.status(403).json({ success: false, message: "can only delete your own comment" });
+    }
+
+    await pool.query(`DELETE FROM comment_likes WHERE comment_id = ?`, [cid]);
+    const parentId = record.parent_comment_id ?? null;
+    const hasReplies = Number(record.reply_count || 0) > 0;
+
+    if (hasReplies) {
+      const ready = await ensureCommentInHotTable(cid);
+      if (!ready) {
+        return res.status(404).json({ success: false, message: "comment not found" });
+      }
+      await markCommentDeleted(cid);
+      const row = await fetchCommentWithUser(cid);
+      const data = {
+        id: row.id,
+        post_id: row.post_id,
+        user_id: row.user_id,
+        parent_id: row.parent_comment_id ?? row.parent_id,
+        content: "Comment deleted by author.",
+        like_count: 0,
+        status: "DELETED",
+        is_deleted: true,
+        created_at: row.created_at,
+        user: { id: row.user_id, nickname: row.nickname || "旅人", avatar_url: row.avatar_url || null },
+      };
+      return res.json({ success: true, deleted: true, hard_deleted: false, data });
+    }
+
+    await deleteCommentRecord(record);
+    if (parentId) {
+      await bumpCommentCounter(parentId, "reply_count", -1);
+    }
+
+    return res.json({
+      success: true,
+      deleted: true,
+      hard_deleted: true,
+      data: {
+        id: cid,
+        parent_id: parentId,
+      },
+    });
+  } catch (err) {
+    console.error("delete comment error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });

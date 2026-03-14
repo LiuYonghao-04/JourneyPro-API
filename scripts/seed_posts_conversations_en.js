@@ -360,6 +360,23 @@ const buildSyntheticImageUrls = (poi) => {
   ];
 };
 
+const buildSyntheticImageUrlsForPost = (poi, ordinal = 0) => {
+  const categoryKey = getCategoryKey(poi);
+  const tags = categoryPhotoTokens[categoryKey] || ["london", "travel", "city"];
+  const pathTags = tags.map((item) => item.replace(/[^a-z0-9-]/gi, "")).filter(Boolean).join(",");
+  const baseSeed =
+    (Number(poi?.id) || stableHash(`${poi?.name || ""}|${categoryKey}|${poi?.city || ""}`)) * 97 +
+    Number(ordinal || 0) * 31;
+  return [
+    `https://loremflickr.com/1280/864/${pathTags}?lock=${baseSeed * 13 + 1}`,
+    `https://loremflickr.com/1280/864/${pathTags}?lock=${baseSeed * 13 + 2}`,
+    `https://picsum.photos/seed/journeypro-${baseSeed}-a/1280/864`,
+    `https://picsum.photos/seed/journeypro-${baseSeed}-b/1280/864`,
+    `https://picsum.photos/seed/journeypro-${baseSeed}-c/1280/864`,
+    `https://picsum.photos/seed/journeypro-${baseSeed}-d/1280/864`,
+  ];
+};
+
 const buildFixedPlans = (pois) => {
   const counts = new Map();
   for (let i = 0; i < POST_TARGET; i += 1) {
@@ -406,43 +423,38 @@ const buildPostPlans = (pois) => {
   return buildWeightedPlans(pois);
 };
 
-const buildPoiImageMap = (pois, poiPhotoMap) => {
-  const claimed = new Map();
-  const map = new Map();
+const createPostImageAllocator = (poiPhotoMap) => {
+  const claimed = new Set();
 
-  const tryClaim = (poiId, rawUrl) => {
+  const tryClaim = (rawUrl) => {
     const url = normalize(rawUrl);
     if (!isHttp(url)) return "";
-    const owner = claimed.get(url);
-    if (owner && owner !== poiId) return "";
-    claimed.set(url, poiId);
+    if (claimed.has(url)) return "";
+    claimed.add(url);
     return url;
   };
 
-  for (const poi of pois) {
+  return (poi, ordinal = 0) => {
     const poiId = Number(poi.id);
     const images = [];
-    const generated = buildSyntheticImageUrls(poi);
-    const cover = generated[0];
-    images.push(cover);
-
     const candidates = unique([...(poiPhotoMap.get(poiId) || []), poi.image_url]);
     for (const candidate of candidates) {
-      const claimedUrl = tryClaim(poiId, candidate);
+      const claimedUrl = tryClaim(candidate);
+      if (!claimedUrl || images.includes(claimedUrl)) continue;
+      images.push(claimedUrl);
+      if (images.length >= 2) break;
+    }
+
+    const generated = buildSyntheticImageUrlsForPost(poi, ordinal);
+    for (const generatedUrl of generated) {
+      const claimedUrl = tryClaim(generatedUrl);
       if (!claimedUrl || images.includes(claimedUrl)) continue;
       images.push(claimedUrl);
       if (images.length >= 4) break;
     }
 
-    for (const generatedUrl of generated.slice(1)) {
-      if (images.includes(generatedUrl)) continue;
-      images.push(generatedUrl);
-      if (images.length >= 4) break;
-    }
-
-    map.set(poiId, images.slice(0, 4));
-  }
-  return map;
+    return images.slice(0, 4);
+  };
 };
 
 const main = async () => {
@@ -493,7 +505,7 @@ const main = async () => {
     let imageInserted = 0;
     let commentInserted = 0;
     const postPlans = buildPostPlans(pois);
-    const poiImageMap = buildPoiImageMap(pois, poiPhotoMap);
+    const allocatePostImages = createPostImageAllocator(poiPhotoMap);
     const planStats = postPlans.reduce(
       (acc, item) => {
         acc.total += item.count;
@@ -505,13 +517,12 @@ const main = async () => {
 
     for (const plan of postPlans) {
       const poi = plan.poi;
-      const baseImages = unique(poiImageMap.get(Number(poi.id)) || buildSyntheticImageUrls(poi)).slice(0, 4);
-      if (!baseImages.length) continue;
 
       for (let i = 0; i < plan.count; i += 1) {
         const userId = randPick(userIds);
         const createdAt = toDate(randInt(0, 90 * 24 * 3600 * 1000));
-        const postImages = baseImages;
+        const postImages = unique(allocatePostImages(poi, i)).slice(0, 4);
+        if (!postImages.length) continue;
         const title = buildPostTitle(poi).slice(0, 100);
         const content = buildPostText(poi);
         const tags = buildTags(poi);
