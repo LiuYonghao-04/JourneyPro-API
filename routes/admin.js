@@ -7,9 +7,6 @@ const OVERVIEW_TTL_MS = 60 * 1000;
 const LARGE_TABLE_NAMES = [
   "post_comments",
   "post_comments_archive",
-  "post_likes",
-  "post_favorites",
-  "user_follows",
 ];
 
 let overviewCache = {
@@ -86,12 +83,15 @@ async function fetchOverviewData() {
           COALESCE(AVG(like_count), 0) AS avg_likes,
           COALESCE(AVG(favorite_count), 0) AS avg_favorites,
           COALESCE(AVG(view_count), 0) AS avg_views,
+          COALESCE(SUM(like_count), 0) AS like_total,
+          COALESCE(SUM(favorite_count), 0) AS favorite_total,
           SUM(CASE WHEN poi_id IS NOT NULL THEN 1 ELSE 0 END) AS poi_linked_posts,
           COUNT(*) AS post_total
         FROM posts
         WHERE COALESCE(status, 'NORMAL') = 'NORMAL'
       `
     ),
+    pool.query(`SELECT COUNT(*) AS total FROM user_follows WHERE COALESCE(status, 'NORMAL') = 'NORMAL'`),
     pool.query(
       `
         SELECT
@@ -130,6 +130,7 @@ async function fetchOverviewData() {
 
   const approxMap = settled[3]?.status === "fulfilled" ? settled[3].value : new Map();
   const postSnapshot = settled[4]?.status === "fulfilled" ? safeRows(settled[4].value)?.[0] || {} : {};
+  const exactFollowTotal = settled[5]?.status === "fulfilled" ? oneValue(settled[5].value) : 0;
   const totalPosts = safeNumber(postSnapshot.post_total);
   const poiLinkedPosts = safeNumber(postSnapshot.poi_linked_posts);
 
@@ -140,9 +141,9 @@ async function fetchOverviewData() {
       users: settled[2]?.status === "fulfilled" ? oneValue(settled[2].value) : 0,
       comments:
         safeNumber(approxMap.get("post_comments")) + safeNumber(approxMap.get("post_comments_archive")),
-      likes: safeNumber(approxMap.get("post_likes")),
-      favorites: safeNumber(approxMap.get("post_favorites")),
-      follows: safeNumber(approxMap.get("user_follows")),
+      likes: safeNumber(postSnapshot.like_total),
+      favorites: safeNumber(postSnapshot.favorite_total),
+      follows: exactFollowTotal,
     },
     recent: {
       posts_24h: safeNumber(postSnapshot.posts_24h),
@@ -152,10 +153,10 @@ async function fetchOverviewData() {
       avg_views_per_post: Math.round(safeNumber(postSnapshot.avg_views) * 10) / 10,
       poi_link_rate: totalPosts > 0 ? Math.round((poiLinkedPosts * 100) / totalPosts) : 0,
     },
-    top_posts: settled[5]?.status === "fulfilled" ? safeRows(settled[5].value) : [],
+    top_posts: settled[6]?.status === "fulfilled" ? safeRows(settled[6].value) : [],
     active_users:
-      settled[6]?.status === "fulfilled"
-        ? safeRows(settled[6].value).map((row) => ({
+      settled[7]?.status === "fulfilled"
+        ? safeRows(settled[7].value).map((row) => ({
             ...row,
             activity_score: safeNumber(row.activity_score),
             comment_count: 0,

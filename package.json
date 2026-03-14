@@ -22,6 +22,8 @@
     "posts:comments:backfill-tiered": "node scripts/post_comments_backfill_tiered.js",
     "social:seed": "node scripts/seed_social_interactions.js",
     "social:shadow:align": "node scripts/social_shadow_align_counts.js",
+    "social:rebalance:compact": "node scripts/social_rebalance_compact.js",
+    "social:rebalance:compact:restore": "node scripts/social_rebalance_compact_restore.js",
     "social:rebalance:safe": "node scripts/social_rebalance_safe.js",
     "social:rebalance:restore": "node scripts/social_rebalance_restore.js",
     "social:rebalance:fast": "node scripts/social_rebalance_fast_safe.js",
