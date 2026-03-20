@@ -926,6 +926,147 @@ const buildAiAdjustment = (item, intent) => {
   };
 };
 
+const normalizeCategoryKey = (value) => String(value || "").trim().toLowerCase() || "unknown";
+
+const buildCategoryMixPolicy = ({ intent, outputLimit }) => {
+  const safeLimit = Math.max(1, Number(outputLimit) || 0);
+  const avoidSet = new Set(Array.isArray(intent?.avoidCategories) ? intent.avoidCategories : []);
+  const preferred = (Array.isArray(intent?.preferredCategories) ? intent.preferredCategories : []).filter(
+    (category) => !avoidSet.has(category)
+  );
+  const preferredSet = new Set(preferred);
+  const strongestPreferredSignal =
+    (Array.isArray(intent?.categorySignals) ? intent.categorySignals : []).find((row) => preferredSet.has(row.category)) || null;
+  const focusedSingleCategory =
+    preferred.length === 1 &&
+    strongestPreferredSignal &&
+    (strongestPreferredSignal.positiveScore > 0 || strongestPreferredSignal.totalScore >= 2);
+
+  const softCap = clamp(
+    focusedSingleCategory ? Math.ceil(safeLimit * 0.62) : Math.ceil(safeLimit * 0.4),
+    2,
+    Math.max(2, safeLimit - 1)
+  );
+  const hardCap = clamp(
+    focusedSingleCategory ? Math.ceil(safeLimit * 0.82) : Math.ceil(safeLimit * 0.55),
+    softCap,
+    safeLimit
+  );
+
+  return {
+    preferredSet,
+    avoidSet,
+    focusedSingleCategory,
+    softCap,
+    hardCap,
+  };
+};
+
+const hasAlternativeCategoryCapacity = ({ remaining, counts, currentCategory, softCap }) =>
+  remaining.some((item) => {
+    const category = normalizeCategoryKey(item?.category);
+    if (category === currentCategory) return false;
+    return (counts.get(category) || 0) < softCap;
+  });
+
+const selectDiversifiedItems = ({ candidates, intent, outputLimit }) => {
+  const remaining = Array.isArray(candidates) ? [...candidates] : [];
+  const selected = [];
+  const counts = new Map();
+  const safeLimit = Math.max(1, Number(outputLimit) || 0);
+  const policy = buildCategoryMixPolicy({ intent, outputLimit: safeLimit });
+
+  while (selected.length < safeLimit && remaining.length) {
+    let bestIndex = 0;
+    let bestAdjustedScore = Number.NEGATIVE_INFINITY;
+    let bestPenalty = 0;
+    let bestCategoryCountBefore = 0;
+    let bestReasons = [];
+
+    for (let index = 0; index < remaining.length; index += 1) {
+      const item = remaining[index];
+      const category = normalizeCategoryKey(item?.category);
+      const categoryCountBefore = counts.get(category) || 0;
+      const baseScore = safeNumber(item?.ai_meta?.ai_final);
+      const reasons = [];
+      let adjustedScore = baseScore;
+      let penalty = 0;
+
+      if (categoryCountBefore === 0) {
+        adjustedScore += 0.045;
+        reasons.push("category mix bonus");
+      } else if (categoryCountBefore === 1) {
+        adjustedScore += 0.012;
+      }
+
+      if (categoryCountBefore >= policy.softCap) {
+        const repeatPenalty = 0.11 * (categoryCountBefore - policy.softCap + 1);
+        adjustedScore -= repeatPenalty;
+        penalty += repeatPenalty;
+        reasons.push("repeat category penalty");
+      }
+
+      if (categoryCountBefore >= policy.hardCap) {
+        const altAvailable = hasAlternativeCategoryCapacity({
+          remaining,
+          counts,
+          currentCategory: category,
+          softCap: policy.softCap,
+        });
+        if (altAvailable) {
+          adjustedScore -= 0.32;
+          penalty += 0.32;
+          reasons.push("hard cap penalty");
+        }
+      }
+
+      if (policy.avoidSet.has(category)) {
+        adjustedScore -= 0.08;
+        penalty += 0.08;
+      }
+
+      if (policy.preferredSet.size && !policy.preferredSet.has(category)) {
+        const preferredSelected = [...counts.entries()].reduce(
+          (sum, [key, value]) => sum + (policy.preferredSet.has(key) ? value : 0),
+          0
+        );
+        if (preferredSelected < Math.min(policy.softCap, safeLimit) && selected.length < Math.min(4, safeLimit - 1)) {
+          adjustedScore -= 0.03;
+          penalty += 0.03;
+          reasons.push("preferred-category coverage");
+        }
+      }
+
+      if (adjustedScore > bestAdjustedScore) {
+        bestIndex = index;
+        bestAdjustedScore = adjustedScore;
+        bestPenalty = penalty;
+        bestCategoryCountBefore = categoryCountBefore;
+        bestReasons = reasons;
+      }
+    }
+
+    const [chosen] = remaining.splice(bestIndex, 1);
+    const chosenCategory = normalizeCategoryKey(chosen?.category);
+    counts.set(chosenCategory, (counts.get(chosenCategory) || 0) + 1);
+    selected.push({
+      ...chosen,
+      ai_meta: {
+        ...(chosen?.ai_meta || {}),
+        category_count_before: bestCategoryCountBefore,
+        category_adjusted_score: Number(bestAdjustedScore.toFixed(6)),
+        category_penalty: Number(bestPenalty.toFixed(6)),
+      },
+      explanations: [
+        ...(Array.isArray(chosen?.explanations) ? chosen.explanations : []),
+        ...bestReasons.map((reason) => ({ tag: reason, contribution: null })),
+      ].slice(0, 6),
+    });
+  }
+
+  return selected;
+};
+
 const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLimit }) => {
   const withScore = (Array.isArray(items) ? items : []).map((item) => {
     const distanceScore = clamp01(item?.scores?.distance ?? item?.distance_score);
@@ -965,7 +1106,11 @@ const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLi
     return safeNumber(a?.distance_m || a?.distance) - safeNumber(b?.distance_m || b?.distance);
   });
 
-  return withScore.slice(0, outputLimit);
+  return selectDiversifiedItems({
+    candidates: withScore,
+    intent,
+    outputLimit,
+  });
 };
 
 const buildIntentSummary = (intent) => {
