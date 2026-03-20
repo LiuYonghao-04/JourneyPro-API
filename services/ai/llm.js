@@ -22,6 +22,21 @@ export const getPlannerLlmConfig = () => {
   };
 };
 
+const extractFirstJsonObject = (value) => {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch?.[1]?.trim() || text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+};
+
 const buildSystemPrompt = () =>
   [
     "You are JourneyPro AI, a London-only travel planning assistant.",
@@ -90,6 +105,80 @@ const extractContentFromBlock = (block) => {
   } catch {
     return { done: false, token: "" };
   }
+};
+
+export const classifyPlannerScopeWithLlm = async ({
+  prompt,
+  routeContext,
+}) => {
+  const cfg = getPlannerLlmConfig();
+  if (!cfg.configured) {
+    return {
+      ok: false,
+      provider: cfg.provider,
+      model: cfg.model || "",
+      reason: "missing_llm_config",
+    };
+  }
+
+  const systemPrompt = [
+    "You are a scope classifier for a London-only travel planner.",
+    "Your job is only to decide whether the user's request is clearly asking for a London trip.",
+    "If the request explicitly mentions another city or clearly asks for a non-London plan, mark supported as false.",
+    "If the request clearly describes London landmarks, London districts, or a London route, mark supported as true.",
+    "Treat route coordinates only as supporting evidence. They must never override an explicit non-London request.",
+    "Return strict JSON only with keys: supported, requested_location, confidence, reason.",
+    "confidence must be a number between 0 and 1.",
+  ].join(" ");
+
+  const userPrompt = [
+    `Prompt: ${String(prompt || "").trim() || "N/A"}`,
+    "",
+    "Route context:",
+    JSON.stringify(routeContext || {}, null, 2),
+    "",
+    "Return JSON only.",
+  ].join("\n");
+
+  const response = await fetch(`${cfg.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: cfg.model,
+      temperature: 0,
+      max_tokens: 120,
+      stream: false,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `LLM scope classification failed: ${response.status}`);
+  }
+
+  const payload = await response.json().catch(() => ({}));
+  const content = String(payload?.choices?.[0]?.message?.content || "");
+  const parsed = extractFirstJsonObject(content);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("LLM scope classifier returned non-JSON content");
+  }
+
+  return {
+    ok: true,
+    provider: cfg.provider,
+    model: cfg.model,
+    supported: !!parsed.supported,
+    requestedLocation: String(parsed.requested_location || "").trim() || null,
+    confidence: Math.max(0, Math.min(Number(parsed.confidence) || 0, 1)),
+    reason: String(parsed.reason || "").trim() || "",
+  };
 };
 
 export const streamPlannerNarrativeFromLlm = async ({

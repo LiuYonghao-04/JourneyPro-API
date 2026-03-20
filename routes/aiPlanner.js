@@ -11,7 +11,11 @@ import {
 import { fetchUserRecommendationSettings } from "../services/reco/profiles.js";
 import { runRecommendationV2 } from "../services/reco/ranker.js";
 import { buildPlannerKnowledgePack } from "../services/ai/retrieval.js";
-import { getPlannerLlmConfig, streamPlannerNarrativeFromLlm } from "../services/ai/llm.js";
+import {
+  classifyPlannerScopeWithLlm,
+  getPlannerLlmConfig,
+  streamPlannerNarrativeFromLlm,
+} from "../services/ai/llm.js";
 
 const router = express.Router();
 
@@ -36,6 +40,24 @@ const SUPPORTED_SCOPE_ALIASES = [
   "chelsea",
   "canary wharf",
 ];
+const SUPPORTED_SCOPE_LANDMARKS = [
+  "big ben",
+  "london eye",
+  "london eyes",
+  "tower bridge",
+  "buckingham palace",
+  "british museum",
+  "st paul s cathedral",
+  "st pauls cathedral",
+  "westminster abbey",
+  "trafalgar square",
+  "hyde park",
+  "camden market",
+  "borough market",
+  "tower of london",
+  "covent garden",
+  "piccadilly circus",
+];
 const LOCATION_FILLER_TOKENS = new Set([
   "a",
   "an",
@@ -45,6 +67,17 @@ const LOCATION_FILLER_TOKENS = new Set([
   "my",
   "we",
   "our",
+  "give",
+  "show",
+  "help",
+  "build",
+  "find",
+  "suggest",
+  "suggestion",
+  "suggestions",
+  "recommend",
+  "recommended",
+  "just",
   "want",
   "need",
   "have",
@@ -55,12 +88,18 @@ const LOCATION_FILLER_TOKENS = new Set([
   "near",
   "visit",
   "visiting",
+  "from",
+  "start",
+  "starting",
+  "end",
+  "ending",
   "travel",
   "trip",
   "itinerary",
   "route",
   "plan",
   "planning",
+  "trail",
   "one",
   "two",
   "three",
@@ -74,27 +113,6 @@ const LOCATION_FILLER_TOKENS = new Set([
   "tomorrow",
 ]);
 const LOCATION_SCOPE_CACHE = new Map();
-const NON_LOCATION_INTENT_TAGS = new Set([
-  "give",
-  "show",
-  "help",
-  "make",
-  "build",
-  "find",
-  "suggest",
-  "recommend",
-  "need",
-  "want",
-  "trail",
-  "walk",
-  "walking",
-  "drive",
-  "driving",
-  "route",
-  "routes",
-  "trip",
-  "travel",
-]);
 
 const CATEGORY_HINTS = [
   {
@@ -229,6 +247,12 @@ const ITINERARY_PERIODS = [
   { key: "afternoon", label: "Afternoon", title: "Core Discovery" },
   { key: "evening", label: "Evening", title: "Flexible Finish" },
 ];
+const SUPPORTED_SCOPE_BOUNDS = {
+  minLat: 51.28,
+  maxLat: 51.7,
+  minLng: -0.52,
+  maxLng: 0.33,
+};
 
 const clamp01 = (value) => clamp(Number(value) || 0, 0, 1);
 
@@ -252,10 +276,36 @@ const normalizeLocationText = (value) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const escapeRegex = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const createPhraseRegex = (value) => new RegExp(`\\b${escapeRegex(value).replace(/\s+/g, "\\s+")}\\b`, "i");
+
+const SUPPORTED_SCOPE_PATTERNS = SUPPORTED_SCOPE_ALIASES.map((alias) => ({
+  alias,
+  regex: createPhraseRegex(alias),
+}));
+
+const SUPPORTED_LANDMARK_PATTERNS = SUPPORTED_SCOPE_LANDMARKS.map((alias) => ({
+  alias,
+  regex: createPhraseRegex(alias),
+}));
+
 const isSupportedLondonScope = (value) => {
   const text = normalizeLocationText(value);
   if (!text) return false;
   return SUPPORTED_SCOPE_ALIASES.some((alias) => text === alias || text.includes(alias) || alias.includes(text));
+};
+
+const extractSupportedAliasMentions = (value) => {
+  const text = normalizeLocationText(value);
+  if (!text) return [];
+  return SUPPORTED_SCOPE_PATTERNS.filter((item) => item.regex.test(text)).map((item) => item.alias);
+};
+
+const extractSupportedLandmarkMentions = (value) => {
+  const text = normalizeLocationText(value);
+  if (!text) return [];
+  return SUPPORTED_LANDMARK_PATTERNS.filter((item) => item.regex.test(text)).map((item) => item.alias);
 };
 
 const sanitizeLocationCandidate = (value) => {
@@ -281,8 +331,11 @@ const sanitizeLocationCandidate = (value) => {
 
 const LOCATION_PATTERNS = [
   /\b([a-z][a-z\s-]{1,40}?)\s+(?:trip|itinerary|route|vacation)\b/g,
-  /\b(?:trip|itinerary|route|vacation|travel|visit(?:ing)?|day|plan)\s+(?:to|in|around|for)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:with|for|and|but|prefer|please))|$)/g,
-  /\b(?:in|around|near|to|visit(?:ing)?)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:trip|itinerary|route|with|for|and|but|prefer|please))|$)/g,
+  /\b([a-z][a-z\s-]{1,40}?)\s+(?:(?:\d+|one|two|three|four|five)\s+)?(?:day|days|weekend)\s+(?:trip|trail|plan|itinerary|route)\b/g,
+  /\b(?:trip|itinerary|route|vacation|travel|visit(?:ing)?|day|plan)\s+(?:to|in|around|for)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:with|for|and|but|prefer|please|from|to|start(?:ing)?|end(?:ing)?|i|we|they|avoid|like|love|want|need))|$)/g,
+  /\b(?:in|around|near|to|visit(?:ing)?)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:trip|itinerary|route|with|for|and|but|prefer|please|from|to|start(?:ing)?|end(?:ing)?|i|we|they|avoid|like|love|want|need))|$)/g,
+  /\b(?:from|starting\s+at|start(?:ing)?\s+from)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:to|towards|toward|and|but|with|for|i|we|they|then|after|please))|$)/g,
+  /\b(?:to|towards|toward|ending\s+at|end(?:ing)?\s+at)\s+([a-z][a-z\s-]{1,40}?)(?=(?:\s+(?:with|for|and|but|i|we|they|then|after|please|avoid|like|love|want|need))|$)/g,
 ];
 
 const extractLocationCandidates = (prompt) => {
@@ -303,111 +356,188 @@ const extractLocationCandidates = (prompt) => {
   return [...found].sort((a, b) => b.length - a.length);
 };
 
-const extractFallbackLocationCandidates = (prompt) => {
-  const tags = extractIntentTags(normalizeText(prompt));
-  return tags
-    .filter((token) => token.length >= 4)
-    .filter((token) => !CATEGORY_TOKEN_SET.has(token))
-    .filter((token) => !LOCATION_FILLER_TOKENS.has(token))
-    .filter((token) => !NON_LOCATION_INTENT_TAGS.has(token))
-    .filter((token) => !isSupportedLondonScope(token))
-    .slice(0, 3);
+const isPointWithinSupportedBounds = (point) => {
+  const lat = Number(point?.lat);
+  const lng = Number(point?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  return (
+    lat >= SUPPORTED_SCOPE_BOUNDS.minLat &&
+    lat <= SUPPORTED_SCOPE_BOUNDS.maxLat &&
+    lng >= SUPPORTED_SCOPE_BOUNDS.minLng &&
+    lng <= SUPPORTED_SCOPE_BOUNDS.maxLng
+  );
 };
 
-const resolvePromptScope = async (prompt) => {
-  const explicitCandidates = extractLocationCandidates(prompt);
-  const fallbackCandidates = explicitCandidates.length ? [] : extractFallbackLocationCandidates(prompt);
-  const candidates = explicitCandidates.length ? explicitCandidates : fallbackCandidates;
-  const strictUnsupportedFallback = candidates.length > 0;
-  if (!candidates.length) {
+const buildRouteContextScopeSignals = ({ startPoint, endPoint, viaPoints = [] } = {}) => {
+  const startInside = isPointWithinSupportedBounds(startPoint);
+  const endInside = isPointWithinSupportedBounds(endPoint);
+  const viaInsideCount = (viaPoints || []).filter((point) => isPointWithinSupportedBounds(point)).length;
+  return {
+    startInside,
+    endInside,
+    viaInsideCount,
+    viaCount: Array.isArray(viaPoints) ? viaPoints.length : 0,
+    londonSignalCount: Number(startInside) + Number(endInside) + viaInsideCount,
+  };
+};
+
+const resolveLocationCandidateScope = async (candidate) => {
+  if (isSupportedLondonScope(candidate)) {
     return {
       supported: true,
-      requestedLocation: null,
-      resolvedLocation: null,
+      requestedLocation: candidate,
+      resolvedLocation: SUPPORTED_CITY,
+      reason: "supported_alias_candidate",
     };
   }
 
-  for (const candidate of candidates) {
-    if (isSupportedLondonScope(candidate)) {
-      return {
-        supported: true,
-        requestedLocation: candidate,
-        resolvedLocation: SUPPORTED_CITY,
-      };
-    }
+  if (LOCATION_SCOPE_CACHE.has(candidate)) {
+    return LOCATION_SCOPE_CACHE.get(candidate);
+  }
 
-    const cacheKey = candidate;
-    if (LOCATION_SCOPE_CACHE.has(cacheKey)) {
-      const cached = LOCATION_SCOPE_CACHE.get(cacheKey);
-      if (!cached.supported) return cached;
-      continue;
-    }
+  const response = await axios.get("https://nominatim.openstreetmap.org/search", {
+    params: {
+      format: "json",
+      q: candidate,
+      limit: 1,
+      addressdetails: 1,
+    },
+    timeout: 1500,
+    headers: {
+      "User-Agent": "JourneyPro-AIPlanner/1.0",
+    },
+    validateStatus: () => true,
+  });
 
+  const row = Array.isArray(response.data) ? response.data[0] : null;
+  if (!row) {
+    return {
+      supported: null,
+      requestedLocation: candidate,
+      resolvedLocation: candidate,
+      reason: "no_geocode_match",
+    };
+  }
+
+  const resolvedText = normalizeLocationText(
+    [row.display_name, row?.address?.city, row?.address?.town, row?.address?.state, row?.address?.country]
+      .filter(Boolean)
+      .join(" ")
+  );
+  const resolvedLocation =
+    row?.address?.city ||
+    row?.address?.town ||
+    row?.address?.state ||
+    row?.display_name ||
+    candidate;
+  const scoped = {
+    supported: isSupportedLondonScope(resolvedText),
+    requestedLocation: candidate,
+    resolvedLocation,
+    reason: "geocode_lookup",
+  };
+  LOCATION_SCOPE_CACHE.set(candidate, scoped);
+  if (LOCATION_SCOPE_CACHE.size > 120) {
+    const firstKey = LOCATION_SCOPE_CACHE.keys().next().value;
+    if (firstKey) LOCATION_SCOPE_CACHE.delete(firstKey);
+  }
+  return scoped;
+};
+
+const resolvePromptScope = async (prompt, { startPoint, endPoint, viaPoints } = {}) => {
+  const supportedAliasMentions = extractSupportedAliasMentions(prompt);
+  const supportedLandmarkMentions = extractSupportedLandmarkMentions(prompt);
+  const explicitCandidates = extractLocationCandidates(prompt);
+  const routeSignals = buildRouteContextScopeSignals({ startPoint, endPoint, viaPoints });
+
+  for (const candidate of explicitCandidates) {
     try {
-      const response = await axios.get("https://nominatim.openstreetmap.org/search", {
-        params: {
-          format: "json",
-          q: candidate,
-          limit: 1,
-          addressdetails: 1,
-        },
-        timeout: 1500,
-        headers: {
-          "User-Agent": "JourneyPro-AIPlanner/1.0",
-        },
-        validateStatus: () => true,
-      });
-
-      const row = Array.isArray(response.data) ? response.data[0] : null;
-      if (!row) {
-        if (strictUnsupportedFallback) {
-          return {
-            supported: false,
-            requestedLocation: candidate,
-            resolvedLocation: candidate,
-          };
-        }
-        continue;
-      }
-
-      const resolvedText = normalizeLocationText(
-        [row.display_name, row?.address?.city, row?.address?.town, row?.address?.state, row?.address?.country]
-          .filter(Boolean)
-          .join(" ")
-      );
-      const resolvedLocation =
-        row?.address?.city ||
-        row?.address?.town ||
-        row?.address?.state ||
-        row?.display_name ||
-        candidate;
-      const scoped = {
-        supported: isSupportedLondonScope(resolvedText),
-        requestedLocation: candidate,
-        resolvedLocation,
-      };
-      LOCATION_SCOPE_CACHE.set(cacheKey, scoped);
-      if (LOCATION_SCOPE_CACHE.size > 120) {
-        const firstKey = LOCATION_SCOPE_CACHE.keys().next().value;
-        if (firstKey) LOCATION_SCOPE_CACHE.delete(firstKey);
-      }
-      if (!scoped.supported) return scoped;
-    } catch (err) {
-      if (strictUnsupportedFallback) {
+      const scoped = await resolveLocationCandidateScope(candidate);
+      if (scoped.supported === false) return scoped;
+      if (scoped.supported === true) {
         return {
-          supported: false,
+          supported: true,
           requestedLocation: candidate,
-          resolvedLocation: candidate,
+          resolvedLocation: scoped.resolvedLocation || SUPPORTED_CITY,
+          reason: scoped.reason,
         };
       }
-      // Ignore fallback scope detection failures for ambiguous free-text prompts.
+    } catch {
+      if (supportedAliasMentions.length) {
+        return {
+          supported: true,
+          requestedLocation: supportedAliasMentions[0],
+          resolvedLocation: SUPPORTED_CITY,
+          reason: "prompt_supported_alias",
+        };
+      }
     }
+  }
+
+  if (supportedAliasMentions.length) {
+    return {
+      supported: true,
+      requestedLocation: supportedAliasMentions[0],
+      resolvedLocation: SUPPORTED_CITY,
+      reason: "prompt_supported_alias",
+    };
+  }
+
+  if (supportedLandmarkMentions.length && routeSignals.londonSignalCount >= 2) {
+    return {
+      supported: true,
+      requestedLocation: supportedLandmarkMentions[0],
+      resolvedLocation: SUPPORTED_CITY,
+      reason: "prompt_landmark_and_route_context",
+    };
+  }
+
+  try {
+    const llmScope = await classifyPlannerScopeWithLlm({
+      prompt,
+      routeContext: {
+        supported_city: SUPPORTED_CITY,
+        start_point: startPoint || null,
+        end_point: endPoint || null,
+        via_count: Array.isArray(viaPoints) ? viaPoints.length : 0,
+        route_signals: routeSignals,
+      },
+    });
+    if (llmScope.ok && llmScope.confidence >= 0.7) {
+      return {
+        supported: llmScope.supported,
+        requestedLocation: llmScope.requestedLocation,
+        resolvedLocation: llmScope.supported ? SUPPORTED_CITY : llmScope.requestedLocation,
+        reason: `llm_scope_classifier:${llmScope.reason || "n/a"}`,
+      };
+    }
+  } catch {
+    // Best-effort fallback only.
+  }
+
+  if (explicitCandidates.length && !supportedAliasMentions.length && !supportedLandmarkMentions.length) {
+    return {
+      supported: false,
+      requestedLocation: explicitCandidates[0],
+      resolvedLocation: explicitCandidates[0],
+      reason: "explicit_candidate_default_block",
+    };
+  }
+
+  if (routeSignals.londonSignalCount >= 2) {
+    return {
+      supported: true,
+      requestedLocation: null,
+      resolvedLocation: SUPPORTED_CITY,
+      reason: "route_context_default_allow",
+    };
   }
 
   return {
     supported: true,
-    requestedLocation: candidates[0] || null,
+    requestedLocation: explicitCandidates[0] || supportedAliasMentions[0] || null,
     resolvedLocation: null,
+    reason: "ambiguous_default_allow",
   };
 };
 const buildScopeGuardNarrative = ({ requestedLocation }) => {
@@ -428,6 +558,36 @@ const keywordHits = (text, keywords) => {
     if (text.includes(keyword)) score += 1;
   }
   return score;
+};
+
+const countRegexMatches = (text, regex) => {
+  const target = String(text || "");
+  if (!target) return 0;
+  const flags = regex.flags.includes("g") ? regex.flags : `${regex.flags}g`;
+  const instance = new RegExp(regex.source, flags);
+  let count = 0;
+  let match = instance.exec(target);
+  while (match) {
+    count += 1;
+    match = instance.exec(target);
+  }
+  return count;
+};
+
+const keywordPattern = (keyword) => {
+  const normalized = normalizeText(keyword);
+  if (!normalized) return "";
+  if (normalized.includes(" ")) return escapeRegex(normalized).replace(/\s+/g, "\\s+");
+  if (normalized.endsWith("y") && normalized.length > 3) {
+    return `${escapeRegex(normalized.slice(0, -1))}(?:y|ies)`;
+  }
+  if (/(x|ch|sh)$/i.test(normalized)) {
+    return `${escapeRegex(normalized)}(?:es)?`;
+  }
+  if (normalized.endsWith("s")) {
+    return escapeRegex(normalized);
+  }
+  return `${escapeRegex(normalized)}s?`;
 };
 
 const parseUserId = (value) => {
@@ -516,9 +676,57 @@ const extractIntentTags = (text) => {
     .map(([token]) => token);
 };
 
-const extractAvoidCategories = (text) => {
+const scoreCategoryIntent = (text, hint) => {
+  const keywords = Array.isArray(hint?.keywords) ? hint.keywords : [];
+  let baseScore = 0;
+  let positiveScore = 0;
+  let negativeScore = 0;
+
+  for (const keyword of keywords) {
+    const pattern = keywordPattern(keyword);
+    baseScore += countRegexMatches(text, new RegExp(`\\b${pattern}\\b`, "i"));
+    positiveScore += countRegexMatches(
+      text,
+      new RegExp(`\\b(?:like|love|prefer|enjoy|focus\\s+on|interested\\s+in|more\\s+of)\\b(?:\\s+\\w+){0,5}\\s+${pattern}\\b`, "i")
+    );
+    negativeScore += countRegexMatches(
+      text,
+      new RegExp(`\\b(?:avoid|skip|without|less|rather\\s+than|instead\\s+of|not\\s+into)\\b(?:\\s+\\w+){0,5}\\s+${pattern}\\b`, "i")
+    );
+    negativeScore += countRegexMatches(
+      text,
+      new RegExp(`\\b(?:do\\s+not|don\\s+t|dont|no)\\b(?:\\s+\\w+){0,3}\\s+want(?:\\s+\\w+){0,10}\\s+${pattern}\\b`, "i")
+    );
+    negativeScore += countRegexMatches(
+      text,
+      new RegExp(`\\b(?:not|no)\\b(?:\\s+\\w+){0,2}\\s+(?:just|only)(?:\\s+\\w+){0,6}\\s+${pattern}\\b`, "i")
+    );
+    negativeScore += countRegexMatches(
+      text,
+      new RegExp(`\\bjust\\s+like(?:\\s+\\w+){0,4}\\s+${pattern}\\b`, "i")
+    );
+  }
+
+  const totalScore = baseScore + positiveScore * 2 - negativeScore * 3;
+  return {
+    category: hint.category,
+    baseScore,
+    positiveScore,
+    negativeScore,
+    totalScore,
+  };
+};
+
+const extractCategoryIntentProfile = (text) =>
+  CATEGORY_HINTS.map((hint) => scoreCategoryIntent(text, hint))
+    .filter((row) => row.baseScore > 0 || row.positiveScore > 0 || row.negativeScore > 0)
+    .sort((a, b) => b.totalScore - a.totalScore || b.positiveScore - a.positiveScore || a.category.localeCompare(b.category));
+
+const extractAvoidCategories = (text, categorySignals = null) => {
   const avoidCategories = new Set();
-  if (!includesAnyKeyword(text, AVOID_KEYWORDS)) return avoidCategories;
+  (Array.isArray(categorySignals) ? categorySignals : []).forEach((row) => {
+    if (row.negativeScore > 0) avoidCategories.add(row.category);
+  });
 
   for (const hint of CATEGORY_HINTS) {
     for (const keyword of hint.keywords) {
@@ -532,17 +740,30 @@ const extractAvoidCategories = (text) => {
   return avoidCategories;
 };
 
+const selectPlannerCategoryHint = (intent) => {
+  const signals = Array.isArray(intent?.categorySignals) ? intent.categorySignals : [];
+  const avoidSet = new Set(Array.isArray(intent?.avoidCategories) ? intent.avoidCategories : []);
+  const candidates = signals.filter((row) => row.totalScore > 0 && !avoidSet.has(row.category));
+  if (!candidates.length) return null;
+
+  const [first, second] = candidates;
+  if (first.positiveScore > 0 && first.negativeScore === 0 && (!second || first.totalScore >= second.totalScore + 1)) {
+    return first.category;
+  }
+  if (!second && first.totalScore >= 2) {
+    return first.category;
+  }
+  return null;
+};
+
 const parsePromptIntent = (prompt) => {
   const text = normalizeText(prompt);
-  const categoryScores = CATEGORY_HINTS.map((hint) => ({
-    category: hint.category,
-    score: keywordHits(text, hint.keywords),
-  }))
-    .filter((row) => row.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  const preferredCategories = categoryScores.map((row) => row.category);
-  const avoidCategories = extractAvoidCategories(text);
+  const categorySignals = extractCategoryIntentProfile(text);
+  const avoidCategories = extractAvoidCategories(text, categorySignals);
+  const avoidSet = new Set(avoidCategories);
+  const preferredCategories = categorySignals
+    .filter((row) => row.totalScore > 0 && !avoidSet.has(row.category))
+    .map((row) => row.category);
   const hasExploreSignal = includesAnyKeyword(text, EXPLORE_KEYWORDS);
   const hasSafeSignal = includesAnyKeyword(text, SAFE_KEYWORDS);
   const hasLowDetourSignal = includesAnyKeyword(text, LOW_DETOUR_KEYWORDS);
@@ -560,6 +781,7 @@ const parsePromptIntent = (prompt) => {
 
   return {
     text,
+    categorySignals,
     preferredCategories,
     avoidCategories: [...avoidCategories],
     hasExploreSignal,
@@ -1027,8 +1249,16 @@ router.post("/planner/stream", async (req, res) => {
     });
     const interestWeight = tunedWeights.interestWeight;
     const exploreWeight = tunedWeights.exploreWeight;
-    const categoryHint = parsedIntent.preferredCategories[0] || inferCategoryHint(prompt);
-    const scope = await resolvePromptScope(prompt);
+    const categoryHint =
+      selectPlannerCategoryHint(parsedIntent) ||
+      (parsedIntent.preferredCategories.length === 1 && !parsedIntent.avoidCategories.length
+        ? parsedIntent.preferredCategories[0]
+        : null);
+    const scope = await resolvePromptScope(prompt, {
+      startPoint,
+      endPoint,
+      viaPoints,
+    });
 
     const responseLimit = clamp(limit, 3, 12);
 
