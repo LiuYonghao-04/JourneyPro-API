@@ -20,6 +20,7 @@ import uploadRouter from "./routes/upload.js";
 import recommendationRouter from "./routes/recommendation.js";
 import recoEventsRouter from "./routes/recoEvents.js";
 import aiPlannerRouter from "./routes/aiPlanner.js";
+import aiPlansRouter from "./routes/aiPlans.js";
 import adminRouter from "./routes/admin.js";
 
 const app = express();
@@ -218,6 +219,7 @@ app.use("/api/upload", uploadRouter);
 app.use("/api/recommendation", recommendationRouter);
 app.use("/api/recommendation", recoEventsRouter);
 app.use("/api/ai", aiPlannerRouter);
+app.use("/api/ai", aiPlansRouter);
 app.use("/api/admin", adminRouter);
 
 const PORT = process.env.PORT || 3001;
