@@ -17,7 +17,7 @@ const truncate = (value, limit) => {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return "";
   if (text.length <= limit) return text;
-  return `${text.slice(0, Math.max(0, limit - 1)).trim()}…`;
+  return `${text.slice(0, Math.max(0, limit - 3)).trim()}...`;
 };
 
 const safeJsonParse = (value, fallback = null) => {
@@ -44,21 +44,18 @@ const extractLatestPrompt = (snapshot, fallback = "") => {
   return truncate(fromMessages?.content || fallback || "", 220);
 };
 
-const extractSummary = (snapshot) => {
-  return (
-    truncate(snapshot?.planner_intent?.summary, 220) ||
-    truncate(snapshot?.planner_meta?.prompt_summary, 220) ||
-    truncate(snapshot?.itinerary?.segments?.[0]?.summary, 220) ||
-    truncate(
-      [...extractMessages(snapshot)]
-        .filter((row) => String(row?.role || "") === "assistant")
-        .map((row) => String(row?.content || "").trim())
-        .find(Boolean),
-      220
-    ) ||
-    ""
-  );
-};
+const extractSummary = (snapshot) =>
+  truncate(snapshot?.planner_intent?.summary, 220) ||
+  truncate(snapshot?.planner_meta?.prompt_summary, 220) ||
+  truncate(snapshot?.itinerary?.segments?.[0]?.summary, 220) ||
+  truncate(
+    [...extractMessages(snapshot)]
+      .filter((row) => String(row?.role || "") === "assistant")
+      .map((row) => String(row?.content || "").trim())
+      .find(Boolean),
+    220
+  ) ||
+  "";
 
 const buildDefaultTitle = (snapshot, fallbackPrompt = "") => {
   const prompt = extractLatestPrompt(snapshot, fallbackPrompt);
@@ -345,7 +342,15 @@ router.patch("/plans/:id", async (req, res) => {
         summary,
         promptPreview,
       });
-      fields.push("summary = ?", "prompt_preview = ?", "scope_city = ?", "engine_mode = ?", "stop_count = ?", "via_count = ?", "payload_json = ?");
+      fields.push(
+        "summary = ?",
+        "prompt_preview = ?",
+        "scope_city = ?",
+        "engine_mode = ?",
+        "stop_count = ?",
+        "via_count = ?",
+        "payload_json = ?"
+      );
       params.push(summary || null, promptPreview || null, scopeCity, engineMode, stopCount, viaCount, JSON.stringify(storedPayload));
     }
 
