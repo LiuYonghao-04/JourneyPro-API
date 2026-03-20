@@ -306,6 +306,305 @@ const ensurePoiPhotos = async (poiRow, options = {}) => {
   return unique(photos).slice(0, targetCount);
 };
 
+const fetchPostPrimaryImages = async (postIds) => {
+  const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return new Map();
+  const [rows] = await pool.query(
+    `
+      SELECT post_id, image_url
+      FROM (
+        SELECT
+          post_id,
+          image_url,
+          ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY sort_order ASC, id ASC) AS rn
+        FROM post_images
+        WHERE post_id IN (?)
+      ) t
+      WHERE rn = 1
+    `,
+    [ids]
+  );
+  const map = new Map();
+  rows.forEach((row) => {
+    map.set(Number(row.post_id), normalize(row.image_url));
+  });
+  return map;
+};
+
+const fetchPostTags = async (postIds) => {
+  const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return new Map();
+  const [rows] = await pool.query(
+    `
+      SELECT pt.post_id, t.name
+      FROM post_tags pt
+      JOIN tags t ON t.id = pt.tag_id
+      WHERE pt.post_id IN (?)
+      ORDER BY t.name ASC
+    `,
+    [ids]
+  );
+  const map = new Map();
+  rows.forEach((row) => {
+    const postId = Number(row.post_id);
+    if (!map.has(postId)) map.set(postId, []);
+    map.get(postId).push(normalize(row.name));
+  });
+  return map;
+};
+
+const buildPoiBoundingBox = (lat, lng, radiusMeters) => {
+  const latDelta = radiusMeters / 111320;
+  const lngDelta = radiusMeters / (111320 * Math.max(Math.cos(toRadians(lat)), 0.2));
+  return {
+    minLat: lat - latDelta,
+    maxLat: lat + latDelta,
+    minLng: lng - lngDelta,
+    maxLng: lng + lngDelta,
+  };
+};
+
+const crowdLevelLabel = (value) => {
+  const level = Number(value);
+  if (!Number.isFinite(level) || level <= 0) return "";
+  if (level <= 1) return "quiet";
+  if (level <= 2) return "steady";
+  if (level <= 3) return "busy";
+  return "peak-hour busy";
+};
+
+const buildCommunitySummary = (poiRow, metrics, topTags) => {
+  const postCount = Number(metrics?.post_count) || 0;
+  const avgRating = Number(metrics?.avg_rating);
+  const reviewCount = Number(metrics?.review_count) || 0;
+  const likes = Number(metrics?.total_likes) || 0;
+  const favorites = Number(metrics?.total_favorites) || 0;
+  const views = Number(metrics?.total_views) || 0;
+  const comments = Number(metrics?.comment_count) || 0;
+  const topTagNames = (topTags || []).map((item) => normalize(item?.name)).filter(Boolean);
+
+  const bestFor = [];
+  const watchOutFor = [];
+  const highlights = [];
+
+  if (postCount) highlights.push(`${postCount} community posts linked to this place.`);
+  if (Number.isFinite(avgRating) && avgRating > 0) {
+    highlights.push(`${avgRating.toFixed(1)}/5 average rating across linked stories.`);
+  }
+  if (topTagNames.length) {
+    highlights.push(`Travelers most often mention ${topTagNames.slice(0, 3).join(", ")}.`);
+  }
+  if (likes || favorites || views) {
+    highlights.push(`${likes} likes, ${favorites} saves, and ${views} views across linked posts.`);
+  }
+  if (comments) {
+    highlights.push(`${comments} comments give extra route context and visit tips.`);
+  }
+
+  if (poiRow?.category === "museum" || topTagNames.includes("museum") || topTagNames.includes("history")) {
+    bestFor.push("culture-first routes");
+  }
+  if (poiRow?.category === "food" || topTagNames.includes("coffee") || topTagNames.includes("street-food")) {
+    bestFor.push("food breaks");
+  }
+  if (poiRow?.family_friendly) bestFor.push("family-friendly plans");
+  if (poiRow?.indoor) bestFor.push("rainy-day coverage");
+  if (topTagNames.includes("photography") || topTagNames.includes("night-view")) {
+    bestFor.push("photo-oriented stops");
+  }
+  if (Number(poiRow?.stay_minutes) >= 90) bestFor.push("longer anchor stops");
+
+  if (!poiRow?.indoor && ["park", "nature", "viewpoint"].includes(normalize(poiRow?.category).toLowerCase())) {
+    watchOutFor.push("weather-sensitive");
+  }
+  if (Number(poiRow?.stay_minutes) >= 120) watchOutFor.push("needs a larger time window");
+  if (Number(poiRow?.crowd_level) >= 3) watchOutFor.push(`${crowdLevelLabel(poiRow?.crowd_level)} flow`);
+  if (normalize(poiRow?.opening_hours)) watchOutFor.push("double-check opening hours");
+
+  return {
+    metrics: {
+      post_count: postCount,
+      avg_rating: Number.isFinite(avgRating) ? Number(avgRating.toFixed(1)) : null,
+      review_count: reviewCount,
+      total_likes: likes,
+      total_favorites: favorites,
+      total_views: views,
+      comment_count: comments,
+    },
+    top_tags: topTagNames.slice(0, 6),
+    highlights: unique(highlights).slice(0, 4),
+    best_for: unique(bestFor).slice(0, 5),
+    watch_out_for: unique(watchOutFor).slice(0, 4),
+  };
+};
+
+const fetchPoiCommunitySummary = async (poiRow) => {
+  const poiId = Number(poiRow?.id);
+  if (!Number.isFinite(poiId) || poiId <= 0) return null;
+
+  const [[metricRow]] = await pool.query(
+    `
+      SELECT
+        COUNT(*) AS post_count,
+        AVG(CASE WHEN p.rating BETWEEN 1 AND 5 THEN p.rating END) AS avg_rating,
+        COALESCE(SUM(p.like_count), 0) AS total_likes,
+        COALESCE(SUM(p.favorite_count), 0) AS total_favorites,
+        COALESCE(SUM(p.view_count), 0) AS total_views,
+        (
+          SELECT COUNT(*)
+          FROM post_comments c
+          JOIN posts cp ON cp.id = c.post_id
+          WHERE cp.poi_id = ? AND COALESCE(cp.status, 'NORMAL') = 'NORMAL' AND COALESCE(c.status, 'NORMAL') = 'NORMAL'
+        ) AS comment_count,
+        (
+          SELECT COUNT(*)
+          FROM posts rp
+          WHERE rp.poi_id = ? AND COALESCE(rp.status, 'NORMAL') = 'NORMAL' AND rp.rating BETWEEN 1 AND 5
+        ) AS review_count
+      FROM posts p
+      WHERE p.poi_id = ? AND COALESCE(p.status, 'NORMAL') = 'NORMAL'
+    `,
+    [poiId, poiId, poiId]
+  );
+
+  const [tagRows] = await pool.query(
+    `
+      SELECT t.name, COUNT(*) AS tag_count
+      FROM post_tags pt
+      JOIN tags t ON t.id = pt.tag_id
+      JOIN posts p ON p.id = pt.post_id
+      WHERE p.poi_id = ? AND COALESCE(p.status, 'NORMAL') = 'NORMAL'
+      GROUP BY t.id, t.name
+      ORDER BY tag_count DESC, t.name ASC
+      LIMIT 6
+    `,
+    [poiId]
+  );
+
+  return buildCommunitySummary(poiRow, metricRow || {}, tagRows || []);
+};
+
+const fetchPoiRelatedPosts = async (poiId, limit = 4) => {
+  const safePoiId = Number(poiId);
+  if (!Number.isFinite(safePoiId) || safePoiId <= 0) return [];
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        p.id,
+        p.title,
+        LEFT(p.content, 220) AS excerpt,
+        p.cover_image,
+        p.like_count,
+        p.favorite_count,
+        p.view_count,
+        p.rating,
+        p.created_at,
+        u.nickname,
+        u.avatar_url
+      FROM posts p
+      LEFT JOIN users u ON u.id = p.user_id
+      WHERE p.poi_id = ? AND COALESCE(p.status, 'NORMAL') = 'NORMAL'
+      ORDER BY (p.like_count * 4 + p.favorite_count * 6 + p.view_count * 0.02) DESC, p.created_at DESC, p.id DESC
+      LIMIT ?
+    `,
+    [safePoiId, Math.max(1, Math.min(Number(limit) || 4, 8))]
+  );
+
+  const postIds = rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
+  const [primaryImages, tagsMap] = await Promise.all([
+    fetchPostPrimaryImages(postIds),
+    fetchPostTags(postIds),
+  ]);
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    title: normalize(row.title),
+    excerpt: normalize(row.excerpt),
+    cover_image: normalize(row.cover_image) || primaryImages.get(Number(row.id)) || null,
+    like_count: Number(row.like_count) || 0,
+    favorite_count: Number(row.favorite_count) || 0,
+    view_count: Number(row.view_count) || 0,
+    rating: Number.isFinite(Number(row.rating)) ? Number(row.rating) : null,
+    created_at: row.created_at,
+    author_name: normalize(row.nickname) || "Traveler",
+    author_avatar: normalize(row.avatar_url) || null,
+    tags: (tagsMap.get(Number(row.id)) || []).slice(0, 4),
+  }));
+};
+
+const fetchPoiNeighbors = async ({ poiRow, sameCategory = false, limit = 4, radiusMeters = 1600 }) => {
+  const poiId = Number(poiRow?.id);
+  const lat = Number(poiRow?.lat);
+  const lng = Number(poiRow?.lng);
+  if (!Number.isFinite(poiId) || !Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+
+  const bbox = buildPoiBoundingBox(lat, lng, radiusMeters);
+  const category = normalize(poiRow?.category).toLowerCase();
+  const categoryClause = sameCategory
+    ? `AND LOWER(COALESCE(category, '')) = ?`
+    : category
+      ? `AND LOWER(COALESCE(category, '')) <> ?`
+      : "";
+  const params = [
+    lat,
+    lat,
+    lng,
+    poiId,
+    bbox.minLat,
+    bbox.maxLat,
+    bbox.minLng,
+    bbox.maxLng,
+    ...(categoryClause ? [category] : []),
+    radiusMeters,
+    Math.max(1, Math.min(Number(limit) || 4, 8)),
+  ];
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        id,
+        name,
+        category,
+        lat,
+        lng,
+        address,
+        city,
+        image_url,
+        popularity,
+        (
+          6371000 * 2 * ASIN(
+            SQRT(
+              POWER(SIN(RADIANS(lat - ?) / 2), 2) +
+              COS(RADIANS(?)) * COS(RADIANS(lat)) * POWER(SIN(RADIANS(lng - ?) / 2), 2)
+            )
+          )
+        ) AS distance_m
+      FROM poi
+      WHERE id <> ?
+        AND lat BETWEEN ? AND ?
+        AND lng BETWEEN ? AND ?
+        ${categoryClause}
+      HAVING distance_m <= ?
+      ORDER BY popularity DESC, distance_m ASC, id ASC
+      LIMIT ?
+    `,
+    params
+  );
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    name: normalize(row.name) || "POI",
+    category: normalize(row.category) || "poi",
+    lat: Number(row.lat),
+    lng: Number(row.lng),
+    address: normalize(row.address) || normalize(row.city),
+    image_url: normalize(row.image_url) || null,
+    popularity: Number.isFinite(Number(row.popularity)) ? Number(row.popularity) : null,
+    distance_m: Math.round(Number(row.distance_m) || 0),
+  }));
+};
+
 // GET /api/poi/search?keyword=xx&limit=10
 router.get("/search", async (req, res) => {
   try {
@@ -448,6 +747,18 @@ router.get("/:id", async (req, res) => {
     if ((!row.image_url || !isHttpUrl(row.image_url)) && photos.length) {
       row.image_url = photos[0];
     }
+
+    const [communitySummary, relatedPosts, similarPlaces, pairedPlaces] = await Promise.all([
+      fetchPoiCommunitySummary(row),
+      fetchPoiRelatedPosts(id, 4),
+      fetchPoiNeighbors({ poiRow: row, sameCategory: true, limit: 4, radiusMeters: 1800 }),
+      fetchPoiNeighbors({ poiRow: row, sameCategory: false, limit: 4, radiusMeters: 1400 }),
+    ]);
+
+    row.community_summary = communitySummary;
+    row.related_posts = relatedPosts;
+    row.similar_places = similarPlaces;
+    row.paired_places = pairedPlaces;
 
     res.json({ success: true, data: row });
   } catch (err) {
