@@ -78,21 +78,56 @@ const normalizeRouteContext = (snapshot) => {
   };
 };
 
-const buildListRow = (row) => ({
-  id: Number(row.id),
-  user_id: Number(row.user_id),
-  title: String(row.title || "").trim(),
-  summary: String(row.summary || "").trim(),
-  prompt_preview: String(row.prompt_preview || "").trim(),
-  scope_city: String(row.scope_city || "London").trim(),
-  engine_mode: String(row.engine_mode || "").trim(),
-  request_id: String(row.request_id || "").trim(),
-  stop_count: Number(row.stop_count) || 0,
-  via_count: Number(row.via_count) || 0,
-  is_starred: !!Number(row.is_starred),
-  created_at: row.created_at,
-  updated_at: row.updated_at,
-});
+const extractIntentSnapshot = (snapshot) => {
+  const intent = snapshot?.planner_intent;
+  if (!intent || typeof intent !== "object") return null;
+  return {
+    summary: truncate(intent.summary, 140),
+    pace: String(intent.pace || "").trim() || "balanced",
+    exploration: String(intent.exploration || "").trim() || "balanced",
+    preferred_categories: Array.isArray(intent.preferred_categories) ? intent.preferred_categories.slice(0, 4) : [],
+    avoid_categories: Array.isArray(intent.avoid_categories) ? intent.avoid_categories.slice(0, 3) : [],
+    tags: Array.isArray(intent.tags) ? intent.tags.slice(0, 4) : [],
+  };
+};
+
+const extractProfileSnapshot = (snapshot) => {
+  const profile = snapshot?.profile_snapshot;
+  const routeContext = normalizeRouteContext(snapshot);
+  if (!profile && !routeContext) return null;
+  return {
+    archetype: truncate(profile?.archetype, 60) || "",
+    confidence: Number(profile?.confidence) || 0,
+    dominant_category: truncate(profile?.dominant_category, 60) || "",
+    dominant_tag: truncate(profile?.dominant_tag, 60) || "",
+    source: truncate(profile?.source, 40) || "",
+    interest_weight:
+      Number(profile?.interest_weight ?? routeContext?.interest_weight) || 0,
+    explore_weight:
+      Number(profile?.explore_weight ?? routeContext?.explore_weight) || 0,
+  };
+};
+
+const buildListRow = (row) => {
+  const snapshot = normalizeSnapshot(row.payload_json);
+  return {
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    title: String(row.title || "").trim(),
+    summary: String(row.summary || "").trim(),
+    prompt_preview: String(row.prompt_preview || "").trim(),
+    scope_city: String(row.scope_city || "London").trim(),
+    engine_mode: String(row.engine_mode || "").trim(),
+    request_id: String(row.request_id || "").trim(),
+    stop_count: Number(row.stop_count) || 0,
+    via_count: Number(row.via_count) || 0,
+    is_starred: !!Number(row.is_starred),
+    intent_snapshot: extractIntentSnapshot(snapshot),
+    profile_snapshot: extractProfileSnapshot(snapshot),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+};
 
 const buildStoredPayload = ({ bodySnapshot, title, summary, promptPreview }) => {
   const base = bodySnapshot && typeof bodySnapshot === "object" ? bodySnapshot : {};
@@ -163,7 +198,7 @@ router.get("/plans", async (req, res) => {
     const [rows] = await pool.query(
       `
         SELECT id, user_id, title, summary, prompt_preview, request_id, scope_city, engine_mode,
-               stop_count, via_count, is_starred, created_at, updated_at
+               stop_count, via_count, is_starred, payload_json, created_at, updated_at
         FROM ai_trip_plans
         WHERE user_id = ? AND status = 'ACTIVE'
         ORDER BY is_starred DESC, updated_at DESC, id DESC
@@ -282,7 +317,7 @@ router.post("/plans", async (req, res) => {
     const [[row]] = await pool.query(
       `
         SELECT id, user_id, title, summary, prompt_preview, request_id, scope_city, engine_mode,
-               stop_count, via_count, is_starred, created_at, updated_at
+               stop_count, via_count, is_starred, payload_json, created_at, updated_at
         FROM ai_trip_plans
         WHERE id = ?
         LIMIT 1
@@ -375,7 +410,7 @@ router.patch("/plans/:id", async (req, res) => {
     const [[row]] = await pool.query(
       `
         SELECT id, user_id, title, summary, prompt_preview, request_id, scope_city, engine_mode,
-               stop_count, via_count, is_starred, created_at, updated_at
+               stop_count, via_count, is_starred, payload_json, created_at, updated_at
         FROM ai_trip_plans
         WHERE id = ?
         LIMIT 1
