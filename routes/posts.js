@@ -205,6 +205,24 @@ async function ensureTables() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_trip_meta (
+      post_id BIGINT PRIMARY KEY,
+      trip_style VARCHAR(40) NULL,
+      route_role VARCHAR(40) NULL,
+      pace VARCHAR(30) NULL,
+      visit_time VARCHAR(40) NULL,
+      spend_level VARCHAR(30) NULL,
+      crowd_level VARCHAR(30) NULL,
+      companion_type VARCHAR(30) NULL,
+      best_for TEXT NULL,
+      avoid_for TEXT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_post_trip_meta_style_role (trip_style, route_role, post_id),
+      INDEX idx_post_trip_meta_visit_time (visit_time, post_id)
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS post_comments (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
@@ -275,6 +293,21 @@ async function ensureTables() {
   await tryAlter(`ALTER TABLE post_images MODIFY image_url VARCHAR(600) NOT NULL`);
   await tryAlter(`ALTER TABLE post_images ADD INDEX idx_post_images_post_sort (post_id, sort_order, id)`);
   await tryAlter(`ALTER TABLE post_tags ADD INDEX idx_post_tags_tag_post (tag_id, post_id)`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN trip_style VARCHAR(40) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN route_role VARCHAR(40) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN pace VARCHAR(30) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN visit_time VARCHAR(40) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN spend_level VARCHAR(30) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN crowd_level VARCHAR(30) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN companion_type VARCHAR(30) NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN best_for TEXT NULL`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN avoid_for TEXT NULL`);
+  await tryAlter(
+    `ALTER TABLE post_trip_meta ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+  );
+  await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD INDEX idx_post_trip_meta_style_role (trip_style, route_role, post_id)`);
+  await tryAlter(`ALTER TABLE post_trip_meta ADD INDEX idx_post_trip_meta_visit_time (visit_time, post_id)`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
   await tryAlter(
     `ALTER TABLE post_favorites ADD INDEX idx_post_favorites_owner_created (post_owner_id, created_at, post_id, user_id)`
@@ -293,6 +326,7 @@ async function ensureTables() {
 }
 
 let ensureTablesPromise = null;
+let ensurePostTripMetaTablePromise = null;
 function ensureTablesReady() {
   if (!ensureTablesPromise) {
     ensureTablesPromise = ensureTables().catch((err) => {
@@ -301,6 +335,35 @@ function ensureTablesReady() {
     });
   }
   return ensureTablesPromise;
+}
+
+function ensurePostTripMetaTableReady() {
+  if (!ensurePostTripMetaTablePromise) {
+    ensurePostTripMetaTablePromise = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS post_trip_meta (
+          post_id BIGINT PRIMARY KEY,
+          trip_style VARCHAR(40) NULL,
+          route_role VARCHAR(40) NULL,
+          pace VARCHAR(30) NULL,
+          visit_time VARCHAR(40) NULL,
+          spend_level VARCHAR(30) NULL,
+          crowd_level VARCHAR(30) NULL,
+          companion_type VARCHAR(30) NULL,
+          best_for TEXT NULL,
+          avoid_for TEXT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_post_trip_meta_style_role (trip_style, route_role, post_id),
+          INDEX idx_post_trip_meta_visit_time (visit_time, post_id)
+        )
+      `)
+      .catch((err) => {
+        ensurePostTripMetaTablePromise = null;
+        throw err;
+      });
+  }
+  return ensurePostTripMetaTablePromise;
 }
 
 async function bumpCommentCounter(commentId, field, delta) {
@@ -388,7 +451,7 @@ async function ensureCommentInHotTable(commentId) {
   return !!existsNow?.id;
 }
 
-const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = {}) => ({
+const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = {}, tripMetaMap = new Map()) => ({
   id: row.id,
   poi_id: row.poi_id,
   title: row.title,
@@ -404,6 +467,7 @@ const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = 
   rating: row.rating,
   status: row.status,
   created_at: row.created_at,
+  trip_meta: tripMetaMap.get(row.id) || null,
   poi: row.poi_id
     ? {
         id: row.poi_id,
@@ -425,7 +489,7 @@ const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = 
     },
 });
 
-const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}) => {
+const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}, tripMetaMap = new Map()) => {
   const primaryImage = row.cover_image || primaryImageMap.get(row.id) || "";
   return {
     id: row.id,
@@ -460,7 +524,7 @@ const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}) => {
   };
 };
 
-const normalizeFeedLite = (row, primaryImageMap, userMap = {}) => {
+const normalizeFeedLite = (row, primaryImageMap, userMap = {}, tripMetaMap = new Map()) => {
   const primaryImage = row.cover_image || primaryImageMap.get(row.id) || "";
   return {
     id: row.id,
@@ -476,6 +540,8 @@ const normalizeFeedLite = (row, primaryImageMap, userMap = {}) => {
     _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
     _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
     created_at: row.created_at,
+    trip_meta: tripMetaMap.get(row.id) || null,
+    trip_meta: tripMetaMap.get(row.id) || null,
     poi: row.poi_id
       ? {
           id: row.poi_id,
@@ -604,6 +670,97 @@ async function fetchPoiPhotosByIds(poiIds, limitPerPoi = 6) {
   return map;
 }
 
+function normalizeMultiValueField(value) {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 8);
+  }
+  if (typeof value !== "string") return [];
+  const raw = value.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 8);
+    }
+  } catch {
+    // ignore
+  }
+  return [...new Set(raw.split(/[,\n|/]+/).map((item) => item.trim()).filter(Boolean))].slice(0, 8);
+}
+
+function normalizeTripMetaRow(row) {
+  if (!row) return null;
+  const tripMeta = {
+    trip_style: row.trip_style || null,
+    route_role: row.route_role || null,
+    pace: row.pace || null,
+    visit_time: row.visit_time || null,
+    spend_level: row.spend_level || null,
+    crowd_level: row.crowd_level || null,
+    companion_type: row.companion_type || null,
+    best_for: normalizeMultiValueField(row.best_for),
+    avoid_for: normalizeMultiValueField(row.avoid_for),
+  };
+  const hasValue = Object.values(tripMeta).some((value) => (Array.isArray(value) ? value.length > 0 : !!value));
+  return hasValue ? tripMeta : null;
+}
+
+function sanitizeChoice(value, maxLength = 40) {
+  if (value === null || value === undefined) return null;
+  const next = String(value).trim().slice(0, maxLength);
+  return next || null;
+}
+
+function sanitizeTripMetaInput(input = {}) {
+  if (!input || typeof input !== "object") return null;
+  const tripMeta = {
+    trip_style: sanitizeChoice(input.trip_style),
+    route_role: sanitizeChoice(input.route_role),
+    pace: sanitizeChoice(input.pace, 30),
+    visit_time: sanitizeChoice(input.visit_time),
+    spend_level: sanitizeChoice(input.spend_level, 30),
+    crowd_level: sanitizeChoice(input.crowd_level, 30),
+    companion_type: sanitizeChoice(input.companion_type, 30),
+    best_for: normalizeMultiValueField(input.best_for),
+    avoid_for: normalizeMultiValueField(input.avoid_for),
+  };
+  const hasValue = Object.values(tripMeta).some((value) => (Array.isArray(value) ? value.length > 0 : !!value));
+  return hasValue ? tripMeta : null;
+}
+
+async function fetchTripMeta(postIds) {
+  await ensurePostTripMetaTableReady();
+  const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (!ids.length) return new Map();
+  const [rows] = await pool.query(
+    `
+      SELECT
+        post_id,
+        trip_style,
+        route_role,
+        pace,
+        visit_time,
+        spend_level,
+        crowd_level,
+        companion_type,
+        best_for,
+        avoid_for
+      FROM post_trip_meta
+      WHERE post_id IN (?)
+    `,
+    [ids]
+  );
+  const map = new Map();
+  rows.forEach((row) => {
+    const postId = Number(row.post_id);
+    const normalized = normalizeTripMetaRow(row);
+    if (Number.isFinite(postId) && normalized) {
+      map.set(postId, normalized);
+    }
+  });
+  return map;
+}
+
 async function upsertTags(tagNames) {
   if (!tagNames || tagNames.length === 0) return [];
   const ids = [];
@@ -635,6 +792,7 @@ router.get("/", async (req, res) => {
     const likedBy = req.query.liked_by ? parseInt(req.query.liked_by, 10) : null;
     const favoritedBy = req.query.favorited_by ? parseInt(req.query.favorited_by, 10) : null;
     const poiId = req.query.poi_id ? parseInt(req.query.poi_id, 10) : null;
+    const structuredOnly = req.query.structured_only === "1";
     const cursorCreatedAtRaw = req.query.cursor_created_at ? new Date(String(req.query.cursor_created_at)) : null;
     const cursorIdRaw = req.query.cursor_id ? parseInt(req.query.cursor_id, 10) : null;
     const hasCursor =
@@ -644,7 +802,16 @@ router.get("/", async (req, res) => {
       Number.isFinite(cursorIdRaw) &&
       cursorIdRaw > 0;
     const isPublicFeedCacheable =
-      compact && lite && !viewerId && !userId && !likedBy && !favoritedBy && !poiId && !tag && !hasCursor;
+      compact &&
+      lite &&
+      !viewerId &&
+      !userId &&
+      !likedBy &&
+      !favoritedBy &&
+      !poiId &&
+      !tag &&
+      !structuredOnly &&
+      !hasCursor;
     if (isPublicFeedCacheable) {
       res.setHeader("Cache-Control", "public, max-age=20, stale-while-revalidate=40");
     } else {
@@ -670,6 +837,9 @@ router.get("/", async (req, res) => {
     if (poiId) {
       where += " AND p.poi_id = ?";
       params.push(poiId);
+    }
+    if (structuredOnly) {
+      where += " AND EXISTS (SELECT 1 FROM post_trip_meta ptm WHERE ptm.post_id = p.id)";
     }
     if (tag) {
       const [[tagRow]] = await pool.query(`SELECT id FROM tags WHERE name = ? LIMIT 1`, [tag]);
@@ -738,18 +908,19 @@ router.get("/", async (req, res) => {
     const pageRows = rows.slice(0, limit);
     const ids = pageRows.map((r) => r.id);
     const tagsMap = lite ? new Map() : await fetchTags(ids);
+    const tripMetaMap = await fetchTripMeta(ids);
     let data = [];
     if (compact) {
       const needsPrimaryLookup = pageRows.some((row) => !row.cover_image);
       const primaryImageMap = needsPrimaryLookup ? await fetchPrimaryImages(ids) : new Map();
       data = feedLite
-        ? pageRows.map((r) => normalizeFeedLite(r, primaryImageMap))
-        : pageRows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap));
+        ? pageRows.map((r) => normalizeFeedLite(r, primaryImageMap, {}, tripMetaMap))
+        : pageRows.map((r) => normalizeCompact(r, primaryImageMap, tagsMap, {}, tripMetaMap));
     } else {
       const imagesMap = await fetchImages(ids);
       const poiIds = pageRows.map((r) => r.poi_id).filter(Boolean);
       const poiPhotosMap = await fetchPoiPhotosByIds(poiIds, 6);
-      data = pageRows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap));
+      data = pageRows.map((r) => normalize(r, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap));
     }
     const nextCursor =
       sort === "latest" && pageRows.length
@@ -822,7 +993,8 @@ router.get("/:id", async (req, res) => {
     const imagesMap = await fetchImages([id]);
     const tagsMap = await fetchTags([id]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap) });
+    const tripMetaMap = await fetchTripMeta([id]);
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap) });
   } catch (err) {
     console.error("get post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -840,6 +1012,7 @@ router.post("/", async (req, res) => {
       rating,
       images = [],
       tags = [],
+      trip_meta = null,
     } = req.body || {};
     const missing = [];
     if (!title) missing.push("title");
@@ -886,6 +1059,42 @@ router.post("/", async (req, res) => {
       await pool.query(`INSERT IGNORE INTO post_tags (post_id, tag_id) VALUES ?`, [rows]);
     }
 
+    const tripMeta = sanitizeTripMetaInput(trip_meta);
+    if (tripMeta) {
+      await ensurePostTripMetaTableReady();
+      await pool.query(
+        `
+          INSERT INTO post_trip_meta (
+            post_id, trip_style, route_role, pace, visit_time, spend_level,
+            crowd_level, companion_type, best_for, avoid_for
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            trip_style = VALUES(trip_style),
+            route_role = VALUES(route_role),
+            pace = VALUES(pace),
+            visit_time = VALUES(visit_time),
+            spend_level = VALUES(spend_level),
+            crowd_level = VALUES(crowd_level),
+            companion_type = VALUES(companion_type),
+            best_for = VALUES(best_for),
+            avoid_for = VALUES(avoid_for)
+        `,
+        [
+          postId,
+          tripMeta.trip_style,
+          tripMeta.route_role,
+          tripMeta.pace,
+          tripMeta.visit_time,
+          tripMeta.spend_level,
+          tripMeta.crowd_level,
+          tripMeta.companion_type,
+          JSON.stringify(tripMeta.best_for || []),
+          JSON.stringify(tripMeta.avoid_for || []),
+        ]
+      );
+    }
+
     const [[row]] = await pool.query(
       `SELECT ${POST_SELECT_FIELDS}
        FROM posts p
@@ -897,7 +1106,8 @@ router.post("/", async (req, res) => {
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row?.poi_id], 6);
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap) });
+    const tripMetaMap = await fetchTripMeta([postId]);
+    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap) });
   } catch (err) {
     console.error("create post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -943,6 +1153,7 @@ router.post("/:id/like", async (req, res) => {
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row.poi_id], 6);
+    const tripMetaMap = await fetchTripMeta([postId]);
     if (liked && row?.poi_id) {
       await logRecoPostEvent({
         eventType: "like_post",
@@ -962,7 +1173,11 @@ router.post("/:id/like", async (req, res) => {
         title: row.title,
       });
     }
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap), liked: !existing });
+    res.json({
+      success: true,
+      data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap),
+      liked: !existing,
+    });
   } catch (err) {
     console.error("like post error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -1010,6 +1225,7 @@ router.post("/:id/favorite", async (req, res) => {
     const imagesMap = await fetchImages([postId]);
     const tagsMap = await fetchTags([postId]);
     const poiPhotosMap = await fetchPoiPhotosByIds([row?.poi_id], 6);
+    const tripMetaMap = await fetchTripMeta([postId]);
     if (favored && row?.poi_id) {
       await logRecoPostEvent({
         eventType: "favorite_post",
@@ -1029,7 +1245,11 @@ router.post("/:id/favorite", async (req, res) => {
         title: row.title,
       });
     }
-    res.json({ success: true, data: normalize(row, imagesMap, tagsMap, poiPhotosMap), favorited: !existing });
+    res.json({
+      success: true,
+      data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap),
+      favorited: !existing,
+    });
   } catch (err) {
     console.error("fav post error", err);
     res.status(500).json({ success: false, message: "server error" });
