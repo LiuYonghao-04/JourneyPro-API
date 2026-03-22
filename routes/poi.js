@@ -438,6 +438,22 @@ const buildCommunitySummary = (poiRow, metrics, topTags) => {
   };
 };
 
+const buildPlannerBridge = (poiRow, communitySummary) => {
+  const category = normalize(poiRow?.category).toLowerCase();
+  const tags = (communitySummary?.top_tags || []).slice(0, 3);
+  const bestFor = (communitySummary?.best_for || []).slice(0, 2);
+  const watchOut = (communitySummary?.watch_out_for || []).slice(0, 2);
+  const focus = bestFor.join(" and ") || tags.join(", ") || category || "high-quality stops";
+  const avoid = watchOut.length ? ` Avoid ${watchOut.join(" and ")}.` : "";
+  return {
+    scope_city: normalize(poiRow?.city) || "London",
+    focus_tags: tags,
+    best_for: bestFor,
+    watch_out_for: watchOut,
+    suggested_prompt: `Plan a London route that includes ${normalize(poiRow?.name) || "this place"}. Prioritize ${focus}, keep detours practical, and avoid collapsing the route into only food stops.${avoid}`,
+  };
+};
+
 const fetchPoiCommunitySummary = async (poiRow) => {
   const poiId = Number(poiRow?.id);
   if (!Number.isFinite(poiId) || poiId <= 0) return null;
@@ -759,6 +775,7 @@ router.get("/:id", async (req, res) => {
     row.related_posts = relatedPosts;
     row.similar_places = similarPlaces;
     row.paired_places = pairedPlaces;
+    row.planner_bridge = buildPlannerBridge(row, communitySummary);
 
     res.json({ success: true, data: row });
   } catch (err) {
