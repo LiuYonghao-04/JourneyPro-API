@@ -505,6 +505,7 @@ const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}, tripMetaM
     _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
     _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
     created_at: row.created_at,
+    trip_meta: tripMetaMap.get(row.id) || null,
     poi: row.poi_id
       ? {
           id: row.poi_id,
@@ -728,6 +729,15 @@ function sanitizeTripMetaInput(input = {}) {
   return hasValue ? tripMeta : null;
 }
 
+function parseIdList(value, limit = 12) {
+  if (!value) return [];
+  const raw = Array.isArray(value) ? value : String(value).split(/[,\s;|]+/);
+  return [...new Set(raw.map((item) => Number.parseInt(item, 10)).filter((id) => Number.isFinite(id) && id > 0))].slice(
+    0,
+    limit
+  );
+}
+
 async function fetchTripMeta(postIds) {
   await ensurePostTripMetaTableReady();
   const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
@@ -759,6 +769,80 @@ async function fetchTripMeta(postIds) {
     }
   });
   return map;
+}
+
+async function fetchSectionCards({
+  whereClause = "1 = 1",
+  params = [],
+  viewerId = null,
+  limit = 4,
+  orderBy = "p.created_at DESC, p.id DESC",
+  distanceExpression = null,
+}) {
+  const viewerSelect = viewerId
+    ? `,
+         IF(plv.id IS NULL, 0, 1) AS liked_by_viewer,
+         IF(pfv.id IS NULL, 0, 1) AS favorited_by_viewer`
+    : "";
+  const viewerJoin = viewerId
+    ? `
+       LEFT JOIN post_likes plv ON plv.post_id = p.id AND plv.user_id = ?
+       LEFT JOIN post_favorites pfv ON pfv.post_id = p.id AND pfv.user_id = ?`
+    : "";
+  const distanceSelect = distanceExpression ? `, ${distanceExpression} AS distance_km` : "";
+  const queryParams = viewerId
+    ? [viewerId, viewerId, ...params, Math.max(1, Math.min(Number(limit) || 4, 8))]
+    : [...params, Math.max(1, Math.min(Number(limit) || 4, 8))];
+  const [rows] = await pool.query(
+    `SELECT ${POST_FEED_SELECT_FIELDS}${viewerSelect}${distanceSelect}
+     FROM posts p
+     LEFT JOIN users u ON p.user_id = u.id
+     LEFT JOIN poi ON p.poi_id = poi.id
+     ${viewerJoin}
+     WHERE p.status = 'NORMAL' AND ${whereClause}
+     ORDER BY ${orderBy}
+     LIMIT ?`,
+    queryParams
+  );
+
+  const ids = rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) return [];
+  const [tagsMap, primaryImageMap, tripMetaMap] = await Promise.all([
+    fetchTags(ids),
+    fetchPrimaryImages(ids),
+    fetchTripMeta(ids),
+  ]);
+
+  return rows.map((row) => ({
+    ...normalizeCompact(row, primaryImageMap, tagsMap, {}, tripMetaMap),
+    distance_km: Number.isFinite(Number(row.distance_km)) ? Number(row.distance_km) : null,
+  }));
+}
+
+const dedupeCardsById = (cards, seen = new Set()) => {
+  const output = [];
+  (cards || []).forEach((card) => {
+    const id = Number(card?.id);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) return;
+    seen.add(id);
+    output.push(card);
+  });
+  return output;
+};
+
+function buildGeoDistanceExpression(lat, lng) {
+  const safeLat = Number.parseFloat(Number(lat).toFixed(6));
+  const safeLng = Number.parseFloat(Number(lng).toFixed(6));
+  if (!Number.isFinite(safeLat) || !Number.isFinite(safeLng)) return null;
+  return `
+    6371 * 2 * ASIN(
+      SQRT(
+        POWER(SIN(RADIANS(poi.lat - ${safeLat}) / 2), 2) +
+        COS(RADIANS(${safeLat})) * COS(RADIANS(poi.lat)) *
+        POWER(SIN(RADIANS(poi.lng - ${safeLng}) / 2), 2)
+      )
+    )
+  `;
 }
 
 async function upsertTags(tagNames) {
@@ -955,6 +1039,188 @@ router.get("/reactions/summary", async (req, res) => {
     res.json({ success: true, data: { liked_ids: likedIds, favorited_ids: favoritedIds } });
   } catch (err) {
     console.error("reactions summary error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.get("/sections/spotlight", async (req, res) => {
+  try {
+    await ensureTablesReady();
+
+    const viewerIdRaw = req.query.viewer_id ? parseInt(req.query.viewer_id, 10) : null;
+    const viewerId = Number.isFinite(viewerIdRaw) && viewerIdRaw > 0 ? viewerIdRaw : null;
+    const focusPoiIdRaw = req.query.focus_poi_id ? parseInt(req.query.focus_poi_id, 10) : null;
+    const focusPoiId = Number.isFinite(focusPoiIdRaw) && focusPoiIdRaw > 0 ? focusPoiIdRaw : null;
+    const routePoiIds = parseIdList(req.query.route_poi_ids, 16);
+    const structuredOnly = req.query.structured_only === "1";
+    const poiOnly = req.query.poi_only === "1";
+    const limit = Math.max(2, Math.min(parseInt(req.query.limit || "4", 10) || 4, 6));
+    const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
+    let tripStyle = sanitizeChoice(req.query.trip_style);
+    let anchorLat = req.query.lat !== undefined ? Number.parseFloat(String(req.query.lat)) : null;
+    let anchorLng = req.query.lng !== undefined ? Number.parseFloat(String(req.query.lng)) : null;
+
+    const extraClauses = [];
+    const extraParams = [];
+    if (structuredOnly) {
+      extraClauses.push("EXISTS (SELECT 1 FROM post_trip_meta ptm WHERE ptm.post_id = p.id)");
+    }
+    if (poiOnly) {
+      extraClauses.push("p.poi_id IS NOT NULL");
+    }
+    if (tag) {
+      const [[tagRow]] = await pool.query(`SELECT id FROM tags WHERE name = ? LIMIT 1`, [tag]);
+      if (!tagRow?.id) {
+        return res.json({
+          success: true,
+          data: { featured: null, route_linked: [], nearby: [], same_style: [], meta: { tag, trip_style: tripStyle } },
+        });
+      }
+      extraClauses.push("EXISTS (SELECT 1 FROM post_tags pt WHERE pt.post_id = p.id AND pt.tag_id = ?)");
+      extraParams.push(Number(tagRow.id));
+    }
+    const extraWhere = extraClauses.length ? ` AND ${extraClauses.join(" AND ")}` : "";
+
+    const anchorPoiId = focusPoiId || routePoiIds[0] || null;
+    if ((!Number.isFinite(anchorLat) || !Number.isFinite(anchorLng)) && anchorPoiId) {
+      const [[poiRow]] = await pool.query(`SELECT lat, lng FROM poi WHERE id = ? LIMIT 1`, [anchorPoiId]);
+      if (poiRow) {
+        anchorLat = Number.parseFloat(String(poiRow.lat));
+        anchorLng = Number.parseFloat(String(poiRow.lng));
+      }
+    }
+
+    if (!tripStyle && routePoiIds.length) {
+      const [styleRows] = await pool.query(
+        `
+          SELECT ptm.trip_style, COUNT(*) AS hits, MAX(p.like_count) AS max_likes
+          FROM post_trip_meta ptm
+          JOIN posts p ON p.id = ptm.post_id
+          WHERE p.status = 'NORMAL' AND ptm.trip_style IS NOT NULL AND p.poi_id IN (?)
+          GROUP BY ptm.trip_style
+          ORDER BY hits DESC, max_likes DESC, ptm.trip_style ASC
+          LIMIT 1
+        `,
+        [routePoiIds]
+      );
+      tripStyle = sanitizeChoice(styleRows?.[0]?.trip_style);
+    }
+
+    const seen = new Set();
+    const orderHot = "p.like_count DESC, p.favorite_count DESC, p.view_count DESC, p.created_at DESC, p.id DESC";
+    const featuredClauses = [];
+    const featuredParams = [];
+    if (focusPoiId) {
+      featuredClauses.push({ where: `p.poi_id = ?${extraWhere}`, params: [focusPoiId, ...extraParams] });
+    }
+    if (routePoiIds.length) {
+      featuredClauses.push({ where: `p.poi_id IN (?)${extraWhere}`, params: [routePoiIds, ...extraParams] });
+    }
+    if (tripStyle) {
+      featuredClauses.push({
+        where: `EXISTS (SELECT 1 FROM post_trip_meta ptm WHERE ptm.post_id = p.id AND ptm.trip_style = ?)${extraWhere}`,
+        params: [tripStyle, ...extraParams],
+      });
+    }
+    featuredClauses.push({ where: `p.poi_id IS NOT NULL${extraWhere}`, params: [...extraParams] });
+
+    let featured = null;
+    for (const candidate of featuredClauses) {
+      const cards = await fetchSectionCards({
+        whereClause: candidate.where,
+        params: candidate.params,
+        viewerId,
+        limit: 1,
+        orderBy: orderHot,
+      });
+      const [first] = dedupeCardsById(cards, seen);
+      if (first) {
+        featured = first;
+        break;
+      }
+    }
+    if (!tripStyle && featured?.trip_meta?.trip_style) {
+      tripStyle = sanitizeChoice(featured.trip_meta.trip_style);
+    }
+
+    const routeLinked = routePoiIds.length
+      ? dedupeCardsById(
+          await fetchSectionCards({
+            whereClause: `p.poi_id IN (?)${extraWhere}`,
+            params: [routePoiIds, ...extraParams],
+            viewerId,
+            limit,
+            orderBy: orderHot,
+          }),
+          seen
+        )
+      : [];
+
+    let nearby = [];
+    const distanceExpression =
+      Number.isFinite(anchorLat) && Number.isFinite(anchorLng) ? buildGeoDistanceExpression(anchorLat, anchorLng) : null;
+    if (distanceExpression) {
+      const latSpan = 0.05;
+      const lngSpan = 0.08;
+      const nearbyWhere = [
+        "p.poi_id IS NOT NULL",
+        "poi.lat IS NOT NULL",
+        "poi.lng IS NOT NULL",
+        `poi.lat BETWEEN ? AND ?`,
+        `poi.lng BETWEEN ? AND ?`,
+        anchorPoiId ? "poi.id <> ?" : "1 = 1",
+      ].join(" AND ");
+      nearby = dedupeCardsById(
+        await fetchSectionCards({
+          whereClause: `${nearbyWhere}${extraWhere}`,
+          params: [
+            anchorLat - latSpan,
+            anchorLat + latSpan,
+            anchorLng - lngSpan,
+            anchorLng + lngSpan,
+            ...(anchorPoiId ? [anchorPoiId] : []),
+            ...extraParams,
+          ],
+          viewerId,
+          limit,
+          orderBy: `${distanceExpression} ASC, ${orderHot}`,
+          distanceExpression,
+        }),
+        seen
+      );
+    }
+
+    const sameStyle = tripStyle
+      ? dedupeCardsById(
+          await fetchSectionCards({
+            whereClause: `EXISTS (SELECT 1 FROM post_trip_meta ptm WHERE ptm.post_id = p.id AND ptm.trip_style = ?)${extraWhere}`,
+            params: [tripStyle, ...extraParams],
+            viewerId,
+            limit,
+            orderBy: orderHot,
+          }),
+          seen
+        )
+      : [];
+
+    res.json({
+      success: true,
+      data: {
+        featured,
+        route_linked: routeLinked,
+        nearby,
+        same_style: sameStyle,
+        meta: {
+          focus_poi_id: anchorPoiId,
+          route_poi_count: routePoiIds.length,
+          trip_style: tripStyle || null,
+          structured_only: structuredOnly,
+          tag: tag || null,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("spotlight sections error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });

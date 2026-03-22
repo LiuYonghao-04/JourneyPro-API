@@ -454,6 +454,33 @@ const buildPlannerBridge = (poiRow, communitySummary) => {
   };
 };
 
+const buildPoiHubSummary = (poiRow, communitySummary, relatedPosts = []) => {
+  const name = normalize(poiRow?.name) || "This place";
+  const category = normalize(poiRow?.category).toLowerCase() || "stop";
+  const bestFor = Array.isArray(communitySummary?.best_for) ? communitySummary.best_for.slice(0, 2) : [];
+  const topTags = Array.isArray(communitySummary?.top_tags) ? communitySummary.top_tags.slice(0, 3) : [];
+  const highlights = Array.isArray(communitySummary?.highlights) ? communitySummary.highlights.slice(0, 1) : [];
+  const postCount = Number(communitySummary?.metrics?.post_count) || 0;
+  const pairLead = relatedPosts[0]?.title ? `A strong linked story is "${normalize(relatedPosts[0].title)}".` : "";
+
+  const lead =
+    bestFor.length > 0
+      ? `${name} stands out as a ${category} stop best suited to ${bestFor.join(" and ")}.`
+      : `${name} stands out as a route-friendly ${category} stop in London.`;
+  const communityLead =
+    postCount > 0
+      ? `JourneyPro has ${postCount} linked ${postCount === 1 ? "story" : "stories"} around this place${topTags.length ? `, with tags like ${topTags.join(", ")}` : ""}.`
+      : topTags.length
+        ? `Travelers most often associate it with ${topTags.join(", ")}.`
+        : "";
+  const highlightLead = highlights[0] ? highlights[0] : "";
+
+  return [lead, communityLead, highlightLead, pairLead]
+    .map((item) => String(item || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .join(" ");
+};
+
 const fetchPoiCommunitySummary = async (poiRow) => {
   const poiId = Number(poiRow?.id);
   if (!Number.isFinite(poiId) || poiId <= 0) return null;
@@ -775,6 +802,7 @@ router.get("/:id", async (req, res) => {
     row.related_posts = relatedPosts;
     row.similar_places = similarPlaces;
     row.paired_places = pairedPlaces;
+    row.hub_summary = buildPoiHubSummary(row, communitySummary, relatedPosts);
     row.planner_bridge = buildPlannerBridge(row, communitySummary);
 
     res.json({ success: true, data: row });

@@ -7,6 +7,7 @@ export const DEFAULT_LIMIT = 10;
 export const DEFAULT_CANDIDATE_LIMIT = 180;
 export const DEFAULT_INTEREST_WEIGHT = 0.5;
 export const DEFAULT_EXPLORE_WEIGHT = 0.15;
+export const DEFAULT_DETOUR_TOLERANCE = 0.5;
 
 export const BASE_MODEL_FIXED_WEIGHTS = {
   quality: 0.18,

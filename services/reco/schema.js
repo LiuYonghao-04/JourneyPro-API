@@ -88,11 +88,13 @@ export const ensureRecoTables = async () => {
           user_id BIGINT PRIMARY KEY,
           interest_weight FLOAT NOT NULL DEFAULT 0.5,
           explore_weight FLOAT NOT NULL DEFAULT 0.15,
+          detour_tolerance FLOAT NOT NULL DEFAULT 0.5,
           mode_defaults JSON NULL,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         );
       `);
       await safeAlter(`ALTER TABLE user_recommendation_settings ADD COLUMN explore_weight FLOAT NOT NULL DEFAULT 0.15`);
+      await safeAlter(`ALTER TABLE user_recommendation_settings ADD COLUMN detour_tolerance FLOAT NOT NULL DEFAULT 0.5`);
       await safeAlter(`ALTER TABLE user_recommendation_settings ADD COLUMN mode_defaults JSON NULL`);
 
       await pool.query(`

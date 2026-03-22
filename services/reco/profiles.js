@@ -1,5 +1,6 @@
 ﻿import { pool } from "../../db/connect.js";
 import {
+  DEFAULT_DETOUR_TOLERANCE,
   DEFAULT_EXPLORE_WEIGHT,
   DEFAULT_INTEREST_WEIGHT,
   FEATURE_TYPES,
@@ -70,6 +71,7 @@ export const fetchUserRecommendationSettings = async (userId) => {
       interestWeight: DEFAULT_INTEREST_WEIGHT,
       distanceWeight: 1 - DEFAULT_INTEREST_WEIGHT,
       exploreWeight: DEFAULT_EXPLORE_WEIGHT,
+      detourTolerance: DEFAULT_DETOUR_TOLERANCE,
       modeDefaults: null,
       updatedAt: null,
     };
@@ -78,7 +80,7 @@ export const fetchUserRecommendationSettings = async (userId) => {
   await ensureRecoTables();
   const [[row]] = await pool.query(
     `
-      SELECT interest_weight, explore_weight, mode_defaults, updated_at
+      SELECT interest_weight, explore_weight, detour_tolerance, mode_defaults, updated_at
       FROM user_recommendation_settings
       WHERE user_id = ?
       LIMIT 1
@@ -88,6 +90,7 @@ export const fetchUserRecommendationSettings = async (userId) => {
 
   const interestWeight = normalizeWeight(row?.interest_weight, DEFAULT_INTEREST_WEIGHT);
   const exploreWeight = normalizeWeight(row?.explore_weight, DEFAULT_EXPLORE_WEIGHT);
+  const detourTolerance = normalizeWeight(row?.detour_tolerance, DEFAULT_DETOUR_TOLERANCE);
 
   return {
     userId: uid,
@@ -95,6 +98,7 @@ export const fetchUserRecommendationSettings = async (userId) => {
     interestWeight,
     distanceWeight: round(1 - interestWeight, 6),
     exploreWeight,
+    detourTolerance,
     modeDefaults: parseModeDefaults(row?.mode_defaults),
     updatedAt: row?.updated_at || null,
   };
@@ -102,7 +106,7 @@ export const fetchUserRecommendationSettings = async (userId) => {
 
 export const saveUserRecommendationSettings = async (
   userId,
-  { interestWeight, exploreWeight, modeDefaults = null }
+  { interestWeight, exploreWeight, detourTolerance, modeDefaults = null }
 ) => {
   const uid = Number.parseInt(userId, 10);
   if (!uid) {
@@ -113,19 +117,21 @@ export const saveUserRecommendationSettings = async (
 
   const normalizedInterest = normalizeWeight(interestWeight, DEFAULT_INTEREST_WEIGHT);
   const normalizedExplore = normalizeWeight(exploreWeight, DEFAULT_EXPLORE_WEIGHT);
+  const normalizedDetourTolerance = normalizeWeight(detourTolerance, DEFAULT_DETOUR_TOLERANCE);
   const modeDefaultsJson = modeDefaults && typeof modeDefaults === "object" ? JSON.stringify(modeDefaults) : null;
 
   await pool.query(
     `
-      INSERT INTO user_recommendation_settings (user_id, interest_weight, explore_weight, mode_defaults)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO user_recommendation_settings (user_id, interest_weight, explore_weight, detour_tolerance, mode_defaults)
+      VALUES (?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         interest_weight = VALUES(interest_weight),
         explore_weight = VALUES(explore_weight),
+        detour_tolerance = VALUES(detour_tolerance),
         mode_defaults = VALUES(mode_defaults),
         updated_at = CURRENT_TIMESTAMP
     `,
-    [uid, normalizedInterest, normalizedExplore, modeDefaultsJson]
+    [uid, normalizedInterest, normalizedExplore, normalizedDetourTolerance, modeDefaultsJson]
   );
 
   return fetchUserRecommendationSettings(uid);

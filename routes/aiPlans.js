@@ -75,6 +75,7 @@ const normalizeRouteContext = (snapshot) => {
     via: Array.isArray(context.via) ? context.via : [],
     interest_weight: Number(context.interest_weight) || null,
     explore_weight: Number(context.explore_weight) || null,
+    detour_tolerance: Number(context.detour_tolerance) || null,
   };
 };
 
@@ -105,6 +106,8 @@ const extractProfileSnapshot = (snapshot) => {
       Number(profile?.interest_weight ?? routeContext?.interest_weight) || 0,
     explore_weight:
       Number(profile?.explore_weight ?? routeContext?.explore_weight) || 0,
+    detour_tolerance:
+      Number(profile?.detour_tolerance ?? routeContext?.detour_tolerance) || 0,
   };
 };
 

@@ -1,9 +1,11 @@
 import express from "express";
 import {
   DEFAULT_CANDIDATE_LIMIT,
+  DEFAULT_DETOUR_TOLERANCE,
   DEFAULT_EXPLORE_WEIGHT,
   DEFAULT_INTEREST_WEIGHT,
   DEFAULT_LIMIT,
+  MODE_DEFAULTS,
   clamp,
   normalizeInteger,
   normalizeMode,
@@ -75,6 +77,37 @@ const parseUserId = (value) => {
   return Number.isFinite(uid) && uid > 0 ? uid : null;
 };
 
+const applyDetourToleranceToModeDefaults = (modeDefaults, mode, detourTolerance) => {
+  const safeMode = normalizeMode(mode);
+  const baseDefaults =
+    modeDefaults && typeof modeDefaults === "object" ? { ...modeDefaults } : {};
+  const existingModeDefaults =
+    baseDefaults[safeMode] && typeof baseDefaults[safeMode] === "object"
+      ? { ...baseDefaults[safeMode] }
+      : {};
+  const baseMode = MODE_DEFAULTS[safeMode] || MODE_DEFAULTS.driving;
+  const tolerance = normalizeWeight(detourTolerance, DEFAULT_DETOUR_TOLERANCE);
+  const minuteMultiplier = 0.65 + tolerance * 0.9;
+  const ratioMultiplier = 0.72 + tolerance * 0.68;
+
+  return {
+    ...baseDefaults,
+    [safeMode]: {
+      ...existingModeDefaults,
+      maxDetourMinutes: clamp(
+        (Number(existingModeDefaults.maxDetourMinutes) || baseMode.maxDetourMinutes) * minuteMultiplier,
+        5,
+        40
+      ),
+      maxDetourRatio: clamp(
+        (Number(existingModeDefaults.maxDetourRatio) || baseMode.maxDetourRatio) * ratioMultiplier,
+        0.15,
+        0.65
+      ),
+    },
+  };
+};
+
 // GET /api/route/recommend?start=lng,lat&end=lng,lat&via=lng,lat;lng,lat
 router.get("/recommend", async (req, res) => {
   try {
@@ -111,6 +144,7 @@ router.get("/recommend", async (req, res) => {
       : {
           interestWeight: DEFAULT_INTEREST_WEIGHT,
           exploreWeight: DEFAULT_EXPLORE_WEIGHT,
+          detourTolerance: DEFAULT_DETOUR_TOLERANCE,
           modeDefaults: null,
         };
 
@@ -120,6 +154,14 @@ router.get("/recommend", async (req, res) => {
     const exploreWeight = req.query.explore_weight
       ? normalizeWeight(req.query.explore_weight, settings.exploreWeight)
       : settings.exploreWeight;
+    const detourTolerance = req.query.detour_tolerance
+      ? normalizeWeight(req.query.detour_tolerance, settings.detourTolerance)
+      : settings.detourTolerance;
+    const effectiveModeDefaults = applyDetourToleranceToModeDefaults(
+      settings.modeDefaults,
+      mode,
+      detourTolerance
+    );
 
     const sessionId = String(req.query.session_id || req.headers["x-session-id"] || "").trim() || null;
     const userAgent = req.headers["user-agent"] || "";
@@ -145,7 +187,7 @@ router.get("/recommend", async (req, res) => {
       candidateLimit,
       category,
       radius,
-      modeDefaults: settings.modeDefaults,
+      modeDefaults: effectiveModeDefaults,
       requestId: String(req.query.request_id || "").trim() || null,
       bucket: forceV2 ? "treatment" : ab.bucket,
       debug,
@@ -169,6 +211,7 @@ router.get("/recommend", async (req, res) => {
         interest_weight: interestWeight,
         distance_weight: 1 - interestWeight,
         explore_weight: exploreWeight,
+        detour_tolerance: detourTolerance,
       },
     };
 

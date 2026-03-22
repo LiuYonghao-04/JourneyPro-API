@@ -2,9 +2,12 @@
 import crypto from "crypto";
 import express from "express";
 import {
+  DEFAULT_DETOUR_TOLERANCE,
   DEFAULT_EXPLORE_WEIGHT,
   DEFAULT_INTEREST_WEIGHT,
+  MODE_DEFAULTS,
   clamp,
+  normalizeMode,
   normalizeInteger,
   normalizeWeight,
 } from "../services/reco/constants.js";
@@ -21,6 +24,37 @@ const router = express.Router();
 
 const DEFAULT_START = { lng: -0.1278, lat: 51.5074 };
 const DEFAULT_END = { lng: -0.118, lat: 51.509 };
+
+const applyDetourToleranceToModeDefaults = (modeDefaults, mode, detourTolerance) => {
+  const safeMode = normalizeMode(mode);
+  const baseDefaults =
+    modeDefaults && typeof modeDefaults === "object" ? { ...modeDefaults } : {};
+  const existingModeDefaults =
+    baseDefaults[safeMode] && typeof baseDefaults[safeMode] === "object"
+      ? { ...baseDefaults[safeMode] }
+      : {};
+  const baseMode = MODE_DEFAULTS[safeMode] || MODE_DEFAULTS.driving;
+  const tolerance = normalizeWeight(detourTolerance, DEFAULT_DETOUR_TOLERANCE);
+  const minuteMultiplier = 0.65 + tolerance * 0.9;
+  const ratioMultiplier = 0.72 + tolerance * 0.68;
+
+  return {
+    ...baseDefaults,
+    [safeMode]: {
+      ...existingModeDefaults,
+      maxDetourMinutes: clamp(
+        (Number(existingModeDefaults.maxDetourMinutes) || baseMode.maxDetourMinutes) * minuteMultiplier,
+        5,
+        40
+      ),
+      maxDetourRatio: clamp(
+        (Number(existingModeDefaults.maxDetourRatio) || baseMode.maxDetourRatio) * ratioMultiplier,
+        0.15,
+        0.65
+      ),
+    },
+  };
+};
 
 const SUPPORTED_CITY = "London";
 const SUPPORTED_SCOPE_ALIASES = [
@@ -1377,6 +1411,7 @@ router.post("/planner/stream", async (req, res) => {
       : {
           interestWeight: DEFAULT_INTEREST_WEIGHT,
           exploreWeight: DEFAULT_EXPLORE_WEIGHT,
+          detourTolerance: DEFAULT_DETOUR_TOLERANCE,
           modeDefaults: null,
         };
 
@@ -1386,6 +1421,8 @@ router.post("/planner/stream", async (req, res) => {
 
     const rawInterestWeight = normalizeWeight(req.body?.interest_weight, settings.interestWeight);
     const rawExploreWeight = normalizeWeight(req.body?.explore_weight, settings.exploreWeight);
+    const detourTolerance = normalizeWeight(req.body?.detour_tolerance, settings.detourTolerance);
+    const effectiveModeDefaults = applyDetourToleranceToModeDefaults(settings.modeDefaults, mode, detourTolerance);
     const parsedIntent = parsePromptIntent(prompt);
     const tunedWeights = tuneWeightsByIntent({
       baseInterestWeight: rawInterestWeight,
@@ -1415,6 +1452,7 @@ router.post("/planner/stream", async (req, res) => {
         interest_weight: interestWeight,
         distance_weight: 1 - interestWeight,
         explore_weight: exploreWeight,
+        detour_tolerance: detourTolerance,
         intent: {
           pace: parsedIntent.pace,
           exploration: parsedIntent.exploration,
@@ -1454,6 +1492,7 @@ router.post("/planner/stream", async (req, res) => {
           interest_weight: interestWeight,
           distance_weight: 1 - interestWeight,
           explore_weight: exploreWeight,
+          detour_tolerance: detourTolerance,
         },
         intent: {
           summary: buildIntentSummary(parsedIntent),
@@ -1485,6 +1524,7 @@ router.post("/planner/stream", async (req, res) => {
       interest_weight: interestWeight,
       distance_weight: 1 - interestWeight,
       explore_weight: exploreWeight,
+      detour_tolerance: detourTolerance,
       intent: {
         pace: parsedIntent.pace,
         exploration: parsedIntent.exploration,
@@ -1518,7 +1558,7 @@ router.post("/planner/stream", async (req, res) => {
       candidateLimit: Math.max(120, recallLimit * 16),
       category: categoryHint,
       radius: null,
-      modeDefaults: settings.modeDefaults,
+      modeDefaults: effectiveModeDefaults,
       requestId,
       bucket: "treatment",
       debug: false,
@@ -1638,6 +1678,7 @@ router.post("/planner/stream", async (req, res) => {
         interest_weight: interestWeight,
         distance_weight: 1 - interestWeight,
         explore_weight: exploreWeight,
+        detour_tolerance: detourTolerance,
       },
       intent: {
         summary: buildIntentSummary(parsedIntent),
