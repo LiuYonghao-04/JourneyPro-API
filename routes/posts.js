@@ -1239,13 +1239,25 @@ router.get("/:id", async (req, res) => {
         [id, viewerId]
       );
     }
+    const viewerSelect = viewerId
+      ? `,
+         IF(plv.id IS NULL, 0, 1) AS liked_by_viewer,
+         IF(pfv.id IS NULL, 0, 1) AS favorited_by_viewer`
+      : "";
+    const viewerJoin = viewerId
+      ? `
+         LEFT JOIN post_likes plv ON plv.post_id = p.id AND plv.user_id = ?
+         LEFT JOIN post_favorites pfv ON pfv.post_id = p.id AND pfv.user_id = ?`
+      : "";
+    const detailParams = viewerId ? [viewerId, viewerId, id] : [id];
     const [[row]] = await pool.query(
-      `SELECT ${POST_SELECT_FIELDS}
+      `SELECT ${POST_SELECT_FIELDS}${viewerSelect}
        FROM posts p
        LEFT JOIN users u ON p.user_id = u.id
        LEFT JOIN poi ON p.poi_id = poi.id
+       ${viewerJoin}
        WHERE p.id = ? LIMIT 1`,
-      [id]
+      detailParams
     );
     if (!row) return res.status(404).json({ success: false, message: "not found" });
     if (viewerId && row?.poi_id) {
