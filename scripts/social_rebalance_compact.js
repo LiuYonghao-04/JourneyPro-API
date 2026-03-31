@@ -18,7 +18,7 @@ const DB = {
 };
 
 const CFG = {
-  targetPostLimit: Math.max(2000, Math.min(40000, Number(process.env.SOCIAL_COMPACT_POST_LIMIT || 15000))),
+  targetPostLimit: Math.max(2000, Math.min(120000, Number(process.env.SOCIAL_COMPACT_POST_LIMIT || 15000))),
   targetWindowDays: Math.max(7, Math.min(180, Number(process.env.SOCIAL_COMPACT_WINDOW_DAYS || 45))),
   postInsertBatch: Math.max(200, Math.min(4000, Number(process.env.SOCIAL_COMPACT_INSERT_BATCH || 1200))),
   followInsertBatch: Math.max(200, Math.min(4000, Number(process.env.SOCIAL_COMPACT_FOLLOW_BATCH || 1000))),
@@ -28,6 +28,7 @@ const CFG = {
   maxFavorites: Math.max(2, Number(process.env.SOCIAL_COMPACT_MAX_FAVORITES || 13)),
   followMin: Math.max(2, Number(process.env.SOCIAL_COMPACT_FOLLOW_MIN || 6)),
   followMax: Math.max(10, Number(process.env.SOCIAL_COMPACT_FOLLOW_MAX || 76)),
+  skipFollows: String(process.env.SOCIAL_COMPACT_SKIP_FOLLOWS || "0") === "1",
 };
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -270,26 +271,44 @@ async function selectTargetPosts(conn) {
 
 function buildTargetCounts(posts, userWeights) {
   const total = Math.max(posts.length - 1, 1);
+  const likeRange = Math.max(1, CFG.maxLikes - CFG.minLikes);
+  const favoriteRange = Math.max(1, CFG.maxFavorites - CFG.minFavorites);
   return posts.map((post, index) => {
     const freshnessDays = (NOW - toTs(post.created_at)) / DAY_MS;
     const recencyBoost = clamp(1 - freshnessDays / Math.max(CFG.targetWindowDays, 1), 0, 1);
     const percentile = 1 - index / total;
     const authorBias = buildUserTierProfile(post.user_id, userWeights.get(post.user_id) || 1).reactionBias;
-    const signal = Math.log1p(post.view_count) * 1.5 + post.like_count * 1.2 + post.favorite_count * 1.6;
-    const jitter = ((stableHash(`compact:like:${post.id}`) % 7) - 3) * 0.7;
-    const desiredLikes = Math.round(
-      CFG.minLikes +
-        percentile * 8.4 +
-        recencyBoost * 5.2 +
-        signal * 0.42 +
-        (authorBias - 1) * 4.2 +
-        jitter
+    const rankCurve = Math.pow(percentile, 0.62);
+    const interactionSignal = clamp(
+      (Math.log1p(post.view_count) * 0.08 + Math.log1p(post.like_count + post.favorite_count + 1) * 0.24) / 2.2,
+      0,
+      1
     );
+    const likeJitter = ((stableHash(`compact:like:${post.id}`) % 1000) / 1000 - 0.5) * 0.16;
+    const likeRatio = clamp(
+      0.12 +
+        rankCurve * 0.68 +
+        recencyBoost * 0.08 +
+        interactionSignal * 0.1 +
+        (authorBias - 1) * 0.05 +
+        likeJitter,
+      0,
+      1
+    );
+    const desiredLikes = Math.round(CFG.minLikes + likeRange * likeRatio);
     const targetLikes = clamp(desiredLikes, CFG.minLikes, CFG.maxLikes);
 
-    const favRatio = 0.34 + percentile * 0.12 + recencyBoost * 0.08;
-    const favJitter = ((stableHash(`compact:fav:${post.id}`) % 5) - 2) * 0.55;
-    const desiredFavorites = Math.round(targetLikes * favRatio + favJitter);
+    const favoriteJitter = ((stableHash(`compact:fav:${post.id}`) % 1000) / 1000 - 0.5) * 0.12;
+    const favoriteRatio = clamp(
+      0.08 +
+        rankCurve * 0.56 +
+        recencyBoost * 0.08 +
+        interactionSignal * 0.08 +
+        favoriteJitter,
+      0,
+      1
+    );
+    const desiredFavorites = Math.round(CFG.minFavorites + favoriteRange * favoriteRatio);
     const targetFavorites = clamp(
       desiredFavorites,
       Math.min(CFG.minFavorites, targetLikes),
@@ -342,11 +361,13 @@ async function backupTouchedData(conn, tag, targetTable) {
   const backupTables = {
     likes: `post_likes_compactbak_${tag}`,
     favorites: `post_favorites_compactbak_${tag}`,
-    follows: `user_follows_compactbak_${tag}`,
   };
   await createLikeTableLike(conn, backupTables.likes, "post_likes");
   await createLikeTableLike(conn, backupTables.favorites, "post_favorites");
-  await createLikeTableLike(conn, backupTables.follows, "user_follows");
+  if (!CFG.skipFollows) {
+    backupTables.follows = `user_follows_compactbak_${tag}`;
+    await createLikeTableLike(conn, backupTables.follows, "user_follows");
+  }
 
   await conn.query(`
     INSERT INTO ${qTable(backupTables.likes)}
@@ -360,11 +381,13 @@ async function backupTouchedData(conn, tag, targetTable) {
     FROM post_favorites f
     INNER JOIN ${qTable(targetTable)} t ON t.post_id = f.post_id
   `);
-  await conn.query(`
-    INSERT INTO ${qTable(backupTables.follows)}
-    SELECT *
-    FROM user_follows
-  `);
+  if (!CFG.skipFollows) {
+    await conn.query(`
+      INSERT INTO ${qTable(backupTables.follows)}
+      SELECT *
+      FROM user_follows
+    `);
+  }
 
   return backupTables;
 }
@@ -373,11 +396,13 @@ async function createStageTables(conn, tag) {
   const stageTables = {
     likes: `post_likes_compactnew_${tag}`,
     favorites: `post_favorites_compactnew_${tag}`,
-    follows: `user_follows_compactnew_${tag}`,
   };
   await createLikeTableLike(conn, stageTables.likes, "post_likes");
   await createLikeTableLike(conn, stageTables.favorites, "post_favorites");
-  await createLikeTableLike(conn, stageTables.follows, "user_follows");
+  if (!CFG.skipFollows) {
+    stageTables.follows = `user_follows_compactnew_${tag}`;
+    await createLikeTableLike(conn, stageTables.follows, "user_follows");
+  }
   return stageTables;
 }
 
@@ -521,12 +546,14 @@ async function applyCompactPatch(conn, targetTable, stageTables) {
     FROM ${qTable(stageTables.favorites)}
   `);
 
-  await conn.query(`DELETE FROM user_follows`);
-  await conn.query(`
-    INSERT INTO user_follows (follower_id, following_id, created_at, status)
-    SELECT follower_id, following_id, created_at, status
-    FROM ${qTable(stageTables.follows)}
-  `);
+  if (stageTables.follows) {
+    await conn.query(`DELETE FROM user_follows`);
+    await conn.query(`
+      INSERT INTO user_follows (follower_id, following_id, created_at, status)
+      SELECT follower_id, following_id, created_at, status
+      FROM ${qTable(stageTables.follows)}
+    `);
+  }
 
   await conn.query(`
     UPDATE posts p
@@ -576,12 +603,14 @@ async function restoreCompactPatch(conn, targetTable, backupTables) {
     FROM ${qTable(backupTables.favorites)}
   `);
 
-  await conn.query(`DELETE FROM user_follows`);
-  await conn.query(`
-    INSERT INTO user_follows (follower_id, following_id, created_at, status)
-    SELECT follower_id, following_id, created_at, status
-    FROM ${qTable(backupTables.follows)}
-  `);
+  if (backupTables.follows) {
+    await conn.query(`DELETE FROM user_follows`);
+    await conn.query(`
+      INSERT INTO user_follows (follower_id, following_id, created_at, status)
+      SELECT follower_id, following_id, created_at, status
+      FROM ${qTable(backupTables.follows)}
+    `);
+  }
 
   await conn.query(`
     UPDATE posts p
@@ -620,7 +649,9 @@ async function main() {
     backupTables = await backupTouchedData(conn, tag, targetTable);
     stageTables = await createStageTables(conn, tag);
 
-    const stagedFollowCount = await seedStageFollows(conn, stageTables.follows, userIds, userWeights);
+    const stagedFollowCount = stageTables.follows
+      ? await seedStageFollows(conn, stageTables.follows, userIds, userWeights)
+      : 0;
     const stagedReactions = await seedStageReactions(conn, stageTables, targetPosts, userIds, userWeights);
 
     manifest = {
@@ -647,7 +678,7 @@ async function main() {
     const liveCounts = {
       likes: await countRows(conn, "post_likes"),
       favorites: await countRows(conn, "post_favorites"),
-      follows: await countRows(conn, "user_follows"),
+      follows: CFG.skipFollows ? null : await countRows(conn, "user_follows"),
     };
 
     await writeManifest(dir, {
