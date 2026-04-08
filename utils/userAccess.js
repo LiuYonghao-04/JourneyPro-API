@@ -7,6 +7,10 @@ export const USER_ROLES = {
   ADMIN: "ADMIN",
 };
 
+const DEFAULT_MEMBERSHIP_EXPIRY = "2026-12-01 23:59:59";
+const DEFAULT_BALANCE_CNY = 20;
+const MEMBERSHIP_ROLES = new Set([USER_ROLES.VIP, USER_ROLES.SVIP]);
+
 const VALID_ROLES = new Set(Object.values(USER_ROLES));
 
 const ROLE_META = {
@@ -51,6 +55,63 @@ const normalizeRole = (value) => {
 
 const metaForRole = (role) => ROLE_META[normalizeRole(role)] || ROLE_META[USER_ROLES.USER];
 
+const normalizeDateTime = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  const ts = date.getTime();
+  return Number.isFinite(ts) && ts > 0 ? date.toISOString() : null;
+};
+
+const computeMembershipState = (storedRole, expiresAt) => {
+  const normalizedStoredRole = normalizeRole(storedRole);
+  const normalizedExpiresAt = normalizeDateTime(expiresAt);
+
+  if (normalizedStoredRole === USER_ROLES.ADMIN) {
+    return {
+      storedRole: normalizedStoredRole,
+      effectiveRole: USER_ROLES.ADMIN,
+      expiresAt: null,
+      isActive: true,
+      status: "permanent",
+      daysLeft: null,
+    };
+  }
+
+  if (!MEMBERSHIP_ROLES.has(normalizedStoredRole)) {
+    return {
+      storedRole: normalizedStoredRole,
+      effectiveRole: USER_ROLES.USER,
+      expiresAt: null,
+      isActive: false,
+      status: "none",
+      daysLeft: null,
+    };
+  }
+
+  if (!normalizedExpiresAt) {
+    return {
+      storedRole: normalizedStoredRole,
+      effectiveRole: USER_ROLES.USER,
+      expiresAt: null,
+      isActive: false,
+      status: "expired",
+      daysLeft: 0,
+    };
+  }
+
+  const now = Date.now();
+  const expiryTs = new Date(normalizedExpiresAt).getTime();
+  const isActive = Number.isFinite(expiryTs) && expiryTs > now;
+  return {
+    storedRole: normalizedStoredRole,
+    effectiveRole: isActive ? normalizedStoredRole : USER_ROLES.USER,
+    expiresAt: normalizedExpiresAt,
+    isActive,
+    status: isActive ? "active" : "expired",
+    daysLeft: isActive ? Math.max(0, Math.ceil((expiryTs - now) / 86400000)) : 0,
+  };
+};
+
 async function tryAlter(sql) {
   try {
     await pool.query(sql);
@@ -81,13 +142,28 @@ async function seedDefaultRoles() {
     `,
     [USER_ROLES.USER]
   );
+  await pool.query(
+    `
+      UPDATE users
+      SET role_expires_at = ?, membership_updated_at = COALESCE(membership_updated_at, NOW())
+      WHERE role IN ('VIP', 'SVIP')
+        AND role_expires_at IS NULL
+    `,
+    [DEFAULT_MEMBERSHIP_EXPIRY]
+  );
+  await pool.query(`UPDATE users SET role_expires_at = NULL WHERE role = 'ADMIN'`);
+  await pool.query(`UPDATE users SET balance_cny = ? WHERE balance_cny IS NULL`, [DEFAULT_BALANCE_CNY]);
 }
 
 export async function ensureUserAccessSchema() {
   if (!ensureSchemaPromise) {
     ensureSchemaPromise = (async () => {
       await tryAlter(`ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'USER'`);
+      await tryAlter(`ALTER TABLE users ADD COLUMN role_expires_at DATETIME NULL`);
+      await tryAlter(`ALTER TABLE users ADD COLUMN membership_updated_at DATETIME NULL`);
+      await tryAlter(`ALTER TABLE users ADD COLUMN balance_cny DECIMAL(10,2) NOT NULL DEFAULT 20.00`);
       await tryAlter(`ALTER TABLE users ADD INDEX idx_users_role (role, id)`);
+      await tryAlter(`ALTER TABLE users ADD INDEX idx_users_role_expiry (role, role_expires_at)`);
       await seedDefaultRoles();
     })().catch((err) => {
       ensureSchemaPromise = null;
@@ -99,12 +175,25 @@ export async function ensureUserAccessSchema() {
 
 export function appendUserAccess(user) {
   if (!user || typeof user !== "object") return user;
-  const role = normalizeRole(user.role || (user.is_admin ? USER_ROLES.ADMIN : USER_ROLES.USER));
-  const meta = metaForRole(role);
+  const membership = computeMembershipState(
+    user.role || (user.is_admin ? USER_ROLES.ADMIN : USER_ROLES.USER),
+    user.role_expires_at
+  );
+  const meta = metaForRole(membership.effectiveRole);
+  const storedMeta = metaForRole(membership.storedRole);
   return {
     ...user,
-    role,
+    stored_role: membership.storedRole,
+    stored_role_label: storedMeta.label,
+    role: membership.effectiveRole,
     role_label: meta.label,
+    role_expires_at: membership.expiresAt,
+    membership_expires_at: membership.expiresAt,
+    membership_active: membership.isActive,
+    membership_status: membership.status,
+    membership_days_left: membership.daysLeft,
+    membership_updated_at: normalizeDateTime(user.membership_updated_at),
+    balance_cny: Number(user.balance_cny ?? DEFAULT_BALANCE_CNY),
     ai_monthly_limit: meta.aiLimit,
     ad_monthly_limit: meta.adLimit,
     can_manage_ads: meta.canManageAds,
@@ -118,7 +207,12 @@ export async function fetchUserAccessById(userId, conn = pool) {
   if (!Number.isFinite(uid) || uid <= 0) return null;
   await ensureUserAccessSchema();
   const [rows] = await conn.query(
-    `SELECT id, username, nickname, avatar_url, role, created_at FROM users WHERE id = ? LIMIT 1`,
+    `
+      SELECT id, username, nickname, avatar_url, role, role_expires_at, membership_updated_at, balance_cny, created_at
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+    `,
     [uid]
   );
   if (!rows.length) return null;

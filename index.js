@@ -24,6 +24,7 @@ import aiPlansRouter from "./routes/aiPlans.js";
 import tripsRouter from "./routes/trips.js";
 import adminRouter from "./routes/admin.js";
 import adsRouter from "./routes/ads.js";
+import membershipRouter from "./routes/membership.js";
 
 const app = express();
 app.use(cors());
@@ -225,6 +226,7 @@ app.use("/api/ai", aiPlansRouter);
 app.use("/api", tripsRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/ads", adsRouter);
+app.use("/api/membership", membershipRouter);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {

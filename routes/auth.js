@@ -15,6 +15,9 @@ const mapUser = (row) => ({
   nickname: row.nickname,
   avatar_url: row.avatar_url || null,
   role: row.role || "USER",
+  role_expires_at: row.role_expires_at || null,
+  membership_updated_at: row.membership_updated_at || null,
+  balance_cny: row.balance_cny ?? 20,
 });
 
 const randomKey = () => Math.random().toString(36).slice(2, 10) + Date.now();
@@ -72,6 +75,7 @@ router.post("/register", async (req, res) => {
       nickname,
       avatar_url: finalAvatar,
       role: "USER",
+      balance_cny: 20,
     });
     const token = jwt.sign({ uid: newUser.id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ success: true, token, user: newUser });
