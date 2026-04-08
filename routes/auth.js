@@ -2,7 +2,7 @@ import express from "express";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { pool } from "../db/connect.js";
-import { appendAdminFlag } from "../utils/admin.js";
+import { appendUserAccess, ensureUserAccessSchema } from "../utils/userAccess.js";
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "journeypro-secret";
@@ -14,6 +14,7 @@ const mapUser = (row) => ({
   username: row.username,
   nickname: row.nickname,
   avatar_url: row.avatar_url || null,
+  role: row.role || "USER",
 });
 
 const randomKey = () => Math.random().toString(36).slice(2, 10) + Date.now();
@@ -38,6 +39,7 @@ router.get("/captcha", async (_req, res) => {
 
 router.post("/register", async (req, res) => {
   try {
+    await ensureUserAccessSchema();
     const { username, password, nickname, avatarUrl, avatar_url, captcha_key, captcha_code } = req.body || {};
     const finalAvatar = avatarUrl || avatar_url || null;
     if (!username || !password || !nickname) {
@@ -64,7 +66,13 @@ router.post("/register", async (req, res) => {
       [username, hash, nickname, finalAvatar]
     );
 
-    const newUser = appendAdminFlag({ id: result.insertId, username, nickname, avatar_url: finalAvatar });
+    const newUser = appendUserAccess({
+      id: result.insertId,
+      username,
+      nickname,
+      avatar_url: finalAvatar,
+      role: "USER",
+    });
     const token = jwt.sign({ uid: newUser.id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ success: true, token, user: newUser });
   } catch (err) {
@@ -75,6 +83,7 @@ router.post("/register", async (req, res) => {
 
 router.post("/login", async (req, res) => {
   try {
+    await ensureUserAccessSchema();
     const { username, password } = req.body || {};
     if (!username || !password) {
       return res.status(400).json({ success: false, message: "username/password required" });
@@ -91,7 +100,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ success: false, message: "invalid credentials" });
     }
 
-    const user = appendAdminFlag(mapUser(userRow));
+    const user = appendUserAccess(mapUser(userRow));
     const token = jwt.sign({ uid: user.id }, JWT_SECRET, { expiresIn: "7d" });
     res.json({ success: true, token, user });
   } catch (err) {
@@ -103,6 +112,7 @@ router.post("/login", async (req, res) => {
 // GET /api/auth/user?id=123
 router.get("/user", async (req, res) => {
   try {
+    await ensureUserAccessSchema();
     const id = parseInt(req.query.id || "0", 10);
     if (!id) {
       return res.status(400).json({ success: false, message: "id required" });
@@ -111,7 +121,7 @@ router.get("/user", async (req, res) => {
     if (!rows.length) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
-    res.json({ success: true, user: appendAdminFlag(mapUser(rows[0])) });
+    res.json({ success: true, user: appendUserAccess(mapUser(rows[0])) });
   } catch (err) {
     console.error("fetch user error", err);
     res.status(500).json({ success: false, message: "server error" });
@@ -121,6 +131,7 @@ router.get("/user", async (req, res) => {
 // POST /api/auth/avatar  { user_id, avatar_url }
 router.post("/avatar", async (req, res) => {
   try {
+    await ensureUserAccessSchema();
     const { user_id, avatar_url } = req.body || {};
     const uid = parseInt(user_id || "0", 10);
     if (!uid || !avatar_url) {
@@ -129,7 +140,7 @@ router.post("/avatar", async (req, res) => {
     await pool.query("UPDATE users SET avatar_url = ? WHERE id = ?", [avatar_url, uid]);
     const [rows] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [uid]);
     if (!rows.length) return res.status(404).json({ success: false, message: "user not found" });
-    res.json({ success: true, user: appendAdminFlag(mapUser(rows[0])) });
+    res.json({ success: true, user: appendUserAccess(mapUser(rows[0])) });
   } catch (err) {
     console.error("update avatar error", err);
     res.status(500).json({ success: false, message: "server error" });

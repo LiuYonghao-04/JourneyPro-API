@@ -19,6 +19,7 @@ import {
   getPlannerLlmConfig,
   streamPlannerNarrativeFromLlm,
 } from "../services/ai/llm.js";
+import { consumeAiQuota, fetchAiQuotaStatus } from "../services/ai/quota.js";
 
 const router = express.Router();
 
@@ -627,6 +628,12 @@ const keywordPattern = (keyword) => {
 const parseUserId = (value) => {
   const uid = Number.parseInt(value || "0", 10);
   return Number.isFinite(uid) && uid > 0 ? uid : null;
+};
+
+const parseSessionKey = (value) => {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.replace(/[^\w:-]/g, "").slice(0, 120);
 };
 
 const parseLngLat = (value, fallback = null) => {
@@ -1374,6 +1381,19 @@ const streamText = async (res, text, isClosed) => {
   }
 };
 
+router.get("/planner/quota", async (req, res) => {
+  try {
+    const quota = await fetchAiQuotaStatus({
+      userId: parseUserId(req.query?.user_id),
+      sessionKey: parseSessionKey(req.query?.session_key),
+    });
+    res.json({ success: true, quota });
+  } catch (err) {
+    console.error("planner quota fetch error", err);
+    res.status(500).json({ success: false, message: "Failed to fetch AI planner quota." });
+  }
+});
+
 // POST /api/ai/planner/stream
 router.post("/planner/stream", async (req, res) => {
   let clientClosed = false;
@@ -1392,6 +1412,7 @@ router.post("/planner/stream", async (req, res) => {
   const requestId = crypto.randomUUID();
   const prompt = String(req.body?.prompt || "").trim();
   const userId = parseUserId(req.body?.user_id);
+  const sessionKey = parseSessionKey(req.body?.session_key);
   const limit = normalizeInteger(req.body?.limit, 8, 3, 12);
   const mode = "driving";
 
@@ -1406,6 +1427,34 @@ router.post("/planner/stream", async (req, res) => {
   }
 
   try {
+    const quota = await consumeAiQuota({ userId, sessionKey });
+    if (!quota.allowed) {
+      writeSse(res, "meta", {
+        request_id: requestId,
+        mode,
+        quota,
+      });
+      writeSse(res, "status", {
+        stage: "quota_guard",
+        message: `${quota.role_label} monthly AI limit reached.`,
+      });
+      writeSse(res, "error", {
+        request_id: requestId,
+        message:
+          quota.ai_monthly_limit === null
+            ? "AI planner quota unavailable."
+            : `You have used ${quota.used}/${quota.ai_monthly_limit} AI planner calls this month. Upgrade to VIP or SVIP for more planner runs.`,
+        quota,
+      });
+      writeSse(res, "done", {
+        request_id: requestId,
+        recommendation_count: 0,
+        quota,
+      });
+      res.end();
+      return;
+    }
+
     const settings = userId
       ? await fetchUserRecommendationSettings(userId)
       : {
@@ -1461,6 +1510,7 @@ router.post("/planner/stream", async (req, res) => {
           avoid_categories: parsedIntent.avoidCategories,
           tags: parsedIntent.intentTags,
         },
+        quota,
         category_hint: categoryHint,
         scope: {
           supported: false,
@@ -1504,6 +1554,7 @@ router.post("/planner/stream", async (req, res) => {
         },
         itinerary: null,
         items: [],
+        quota,
         scope: {
           supported: false,
           supported_city: SUPPORTED_CITY,
@@ -1533,6 +1584,7 @@ router.post("/planner/stream", async (req, res) => {
         avoid_categories: parsedIntent.avoidCategories,
         tags: parsedIntent.intentTags,
       },
+      quota,
       category_hint: categoryHint,
       route: {
         start: startPoint,
@@ -1690,6 +1742,7 @@ router.post("/planner/stream", async (req, res) => {
       },
       itinerary,
       items: rankedItems,
+      quota,
       scope: {
         supported: true,
         supported_city: SUPPORTED_CITY,
