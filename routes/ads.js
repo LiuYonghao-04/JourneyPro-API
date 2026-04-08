@@ -6,6 +6,10 @@ const router = express.Router();
 
 const VALID_PLACEMENTS = new Set(["map", "posts"]);
 const ACTIVE_STATUSES = new Set(["ACTIVE", "PAUSED"]);
+const TITLE_LIMIT = 56;
+const SUBTITLE_LIMIT = 88;
+const BODY_LIMIT = 220;
+const CTA_TEXT_LIMIT = 20;
 let ensureAdsSchemaPromise = null;
 const CAMPAIGN_SELECT = `
   SELECT
@@ -295,13 +299,13 @@ router.post("/", requireAdManager, async (req, res) => {
     await ensureAdsSchemaReady();
     const user = req.adUser;
     const roleMeta = getRoleMeta(user.role);
-    const title = truncate(req.body?.title, 160);
-    const subtitle = truncate(req.body?.subtitle, 200);
-    const body = truncate(req.body?.body, 1800);
+    const title = truncate(req.body?.title, TITLE_LIMIT);
+    const subtitle = truncate(req.body?.subtitle, SUBTITLE_LIMIT);
+    const body = truncate(req.body?.body, BODY_LIMIT);
     const imageUrl = normalizeHttpUrl(req.body?.image_url);
     const linkedPostId = parseAdId(req.body?.linked_post_id);
     const placement = normalizePlacement(req.body?.placement);
-    const ctaText = truncate(req.body?.cta_text || "Learn more", 80);
+    const ctaText = truncate(req.body?.cta_text || "Learn more", CTA_TEXT_LIMIT);
     const ctaLink = normalizeHttpUrl(req.body?.cta_link, { allowEmpty: true });
     const usageMonth = toUsageMonth();
 
