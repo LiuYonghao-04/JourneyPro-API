@@ -1,11 +1,12 @@
 import express from "express";
 import { pool } from "../db/connect.js";
-import { fetchUserAccessById, getRoleMeta } from "../utils/userAccess.js";
+import { getRoleMeta } from "../utils/userAccess.js";
+import { parsePositiveInt, requireAdminUser, requireAdManagerUser } from "../utils/accessGuard.js";
 
 const router = express.Router();
 
 const VALID_PLACEMENTS = new Set(["map", "posts"]);
-const ACTIVE_STATUSES = new Set(["ACTIVE", "PAUSED"]);
+const CREATOR_LIVE_STATUSES = new Set(["ACTIVE", "PAUSED"]);
 const TITLE_LIMIT = 56;
 const SUBTITLE_LIMIT = 88;
 const BODY_LIMIT = 220;
@@ -14,22 +15,19 @@ let ensureAdsSchemaPromise = null;
 const CAMPAIGN_SELECT = `
   SELECT
     c.*,
+    owner.nickname AS owner_nickname,
     p.title AS linked_post_title,
     p.cover_image AS linked_post_cover_image
   FROM ad_campaigns c
+  LEFT JOIN users owner
+    ON owner.id = c.user_id
   LEFT JOIN posts p
     ON p.id = c.linked_post_id
    AND COALESCE(p.status, 'NORMAL') = 'NORMAL'
 `;
 
-const parseUserId = (value) => {
-  const uid = Number.parseInt(String(value || ""), 10);
-  return Number.isFinite(uid) && uid > 0 ? uid : 0;
-};
-
 const parseAdId = (value) => {
-  const id = Number.parseInt(String(value || ""), 10);
-  return Number.isFinite(id) && id > 0 ? id : 0;
+  return parsePositiveInt(value);
 };
 
 const normalizePlacement = (value) => {
@@ -39,7 +37,7 @@ const normalizePlacement = (value) => {
 
 const normalizeStatus = (value, fallback = "ACTIVE") => {
   const status = String(value || "").trim().toUpperCase();
-  if (["ACTIVE", "PAUSED", "DELETED"].includes(status)) return status;
+  if (["PENDING", "ACTIVE", "PAUSED", "REJECTED", "DELETED"].includes(status)) return status;
   return fallback;
 };
 
@@ -84,31 +82,14 @@ const toUsageMonth = (value = new Date()) => {
 };
 
 const buildViewerKey = ({ userId, sessionKey }) => {
-  const uid = parseUserId(userId);
+  const uid = parsePositiveInt(userId);
   if (uid) return `user:${uid}`;
   const raw = String(sessionKey || "").trim().replace(/[^\w:-]/g, "").slice(0, 120);
   return raw ? `guest:${raw}` : "guest:anonymous";
 };
 
 async function requireAdManager(req, res, next) {
-  try {
-    const userId = parseUserId(req.query.user_id ?? req.body?.user_id ?? req.get("x-user-id"));
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "user_id required" });
-    }
-    const user = await fetchUserAccessById(userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: "user not found" });
-    }
-    if (!user.can_manage_ads) {
-      return res.status(403).json({ success: false, message: "SVIP or admin access required" });
-    }
-    req.adUser = user;
-    return next();
-  } catch (err) {
-    console.error("ad access check error", err);
-    return res.status(500).json({ success: false, message: "server error" });
-  }
+  return requireAdManagerUser(req, res, next);
 }
 
 async function ensureAdsSchema() {
@@ -126,6 +107,9 @@ async function ensureAdsSchema() {
       cta_text VARCHAR(80) NULL,
       cta_link VARCHAR(1024) NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+      reviewed_at DATETIME NULL,
+      reviewed_by BIGINT UNSIGNED NULL,
+      review_note VARCHAR(255) NULL,
       usage_month CHAR(7) NOT NULL,
       impression_count INT NOT NULL DEFAULT 0,
       unique_viewer_count INT NOT NULL DEFAULT 0,
@@ -154,6 +138,9 @@ async function ensureAdsSchema() {
 
   await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN linked_post_id BIGINT UNSIGNED NULL`);
   await tryAlter(`ALTER TABLE ad_campaigns ADD KEY idx_ad_campaigns_linked_post (linked_post_id)`);
+  await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN reviewed_at DATETIME NULL`);
+  await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN reviewed_by BIGINT UNSIGNED NULL`);
+  await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN review_note VARCHAR(255) NULL`);
 }
 
 function ensureAdsSchemaReady() {
@@ -177,10 +164,14 @@ const mapAdRow = (row) => ({
   linked_post_id: row.linked_post_id ? Number(row.linked_post_id) : null,
   linked_post_title: String(row.linked_post_title || "").trim(),
   linked_post_cover_image: String(row.linked_post_cover_image || "").trim(),
+  owner_nickname: String(row.owner_nickname || "").trim(),
   placement: normalizePlacement(row.placement),
   cta_text: String(row.cta_text || "").trim(),
   cta_link: String(row.cta_link || "").trim(),
   status: normalizeStatus(row.status),
+  reviewed_at: row.reviewed_at || null,
+  reviewed_by: row.reviewed_by ? Number(row.reviewed_by) : null,
+  review_note: String(row.review_note || "").trim(),
   usage_month: String(row.usage_month || "").trim(),
   impression_count: Number(row.impression_count) || 0,
   unique_viewer_count: Number(row.unique_viewer_count) || 0,
@@ -195,6 +186,7 @@ async function buildMonthlyUsage(userId, usageMonth) {
       FROM ad_campaigns
       WHERE user_id = ?
         AND usage_month = ?
+        AND status NOT IN ('DELETED')
     `,
     [userId, usageMonth]
   );
@@ -222,6 +214,11 @@ async function fetchValidLinkedPost(postId) {
     `,
     [pid]
   );
+  return rows[0] || null;
+}
+
+async function fetchCampaignForAdmin(adId) {
+  const [rows] = await pool.query(`${CAMPAIGN_SELECT} WHERE c.id = ? LIMIT 1`, [adId]);
   return rows[0] || null;
 }
 
@@ -328,6 +325,7 @@ router.post("/", requireAdManager, async (req, res) => {
       }
     }
 
+    const initialStatus = user.is_admin ? "ACTIVE" : "PENDING";
     const usedThisMonth = await buildMonthlyUsage(user.id, usageMonth);
     if (roleMeta.adLimit !== null && usedThisMonth >= roleMeta.adLimit) {
       return res.status(403).json({
@@ -340,9 +338,9 @@ router.post("/", requireAdManager, async (req, res) => {
       `
         INSERT INTO ad_campaigns (
           user_id, role_snapshot, title, subtitle, body, image_url, linked_post_id,
-          placement, cta_text, cta_link, status, usage_month
+          placement, cta_text, cta_link, status, reviewed_at, reviewed_by, usage_month
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         user.id,
@@ -355,6 +353,9 @@ router.post("/", requireAdManager, async (req, res) => {
         placement,
         ctaText || null,
         ctaLink || null,
+        initialStatus,
+        user.is_admin ? new Date() : null,
+        user.is_admin ? user.id : null,
         usageMonth,
       ]
     );
@@ -371,10 +372,75 @@ router.post("/", requireAdManager, async (req, res) => {
         remaining: roleMeta.adLimit === null ? null : Math.max(0, roleMeta.adLimit - usedThisMonth - 1),
         unlimited: roleMeta.adLimit === null,
       },
+      moderation: {
+        status: initialStatus,
+        message: initialStatus === "ACTIVE" ? "Campaign is live." : "Campaign submitted for admin review.",
+      },
     });
   } catch (err) {
     console.error("ads create error", err);
     res.status(500).json({ success: false, message: "Failed to create ad campaign." });
+  }
+});
+
+router.get("/review-queue", requireAdminUser, async (_req, res) => {
+  try {
+    await ensureAdsSchemaReady();
+    const [rows] = await pool.query(
+      `
+        ${CAMPAIGN_SELECT}
+        WHERE c.status IN ('PENDING', 'REJECTED')
+        ORDER BY FIELD(c.status, 'PENDING', 'REJECTED'), c.updated_at DESC, c.id DESC
+        LIMIT 24
+      `
+    );
+    res.json({
+      success: true,
+      items: rows.map(mapAdRow),
+    });
+  } catch (err) {
+    console.error("ads review queue error", err);
+    res.status(500).json({ success: false, message: "Failed to load ad review queue." });
+  }
+});
+
+router.post("/:id/review", requireAdminUser, async (req, res) => {
+  try {
+    await ensureAdsSchemaReady();
+    const admin = req.adminUser;
+    const adId = parseAdId(req.params.id);
+    if (!adId) {
+      return res.status(400).json({ success: false, message: "invalid ad id" });
+    }
+    const current = await fetchCampaignForAdmin(adId);
+    if (!current || current.status === "DELETED") {
+      return res.status(404).json({ success: false, message: "ad campaign not found" });
+    }
+    const nextStatus = normalizeStatus(req.body?.status, current.status);
+    if (!["ACTIVE", "PAUSED", "REJECTED"].includes(nextStatus)) {
+      return res.status(400).json({ success: false, message: "status must be ACTIVE, PAUSED or REJECTED" });
+    }
+    const reviewNote = truncate(req.body?.review_note, 255);
+    await pool.query(
+      `
+        UPDATE ad_campaigns
+        SET
+          status = ?,
+          reviewed_at = NOW(),
+          reviewed_by = ?,
+          review_note = ?
+        WHERE id = ?
+      `,
+      [nextStatus, admin.id, reviewNote || null, adId]
+    );
+    const updated = await fetchCampaignForAdmin(adId);
+    res.json({
+      success: true,
+      item: mapAdRow(updated),
+    });
+  } catch (err) {
+    console.error("ads review error", err);
+    res.status(500).json({ success: false, message: "Failed to review ad campaign." });
   }
 });
 
@@ -391,10 +457,26 @@ router.patch("/:id", requireAdManager, async (req, res) => {
       return res.status(404).json({ success: false, message: "ad campaign not found" });
     }
     const nextStatus = normalizeStatus(req.body?.status, current.status);
-    if (!ACTIVE_STATUSES.has(nextStatus)) {
-      return res.status(400).json({ success: false, message: "Only ACTIVE or PAUSED status is allowed here." });
+    const canToggleLive = CREATOR_LIVE_STATUSES.has(current.status) && CREATOR_LIVE_STATUSES.has(nextStatus);
+    const canResubmit = ["PENDING", "REJECTED"].includes(current.status) && nextStatus === "PENDING";
+    if (!canToggleLive && !canResubmit) {
+      return res.status(400).json({
+        success: false,
+        message: "Only ACTIVE/PAUSED toggles or PENDING resubmission are allowed here.",
+      });
     }
-    await pool.query(`UPDATE ad_campaigns SET status = ? WHERE id = ? AND user_id = ?`, [nextStatus, adId, user.id]);
+    await pool.query(
+      `
+        UPDATE ad_campaigns
+        SET
+          status = ?,
+          reviewed_at = CASE WHEN ? = 'PENDING' THEN NULL ELSE reviewed_at END,
+          reviewed_by = CASE WHEN ? = 'PENDING' THEN NULL ELSE reviewed_by END,
+          review_note = CASE WHEN ? = 'PENDING' THEN NULL ELSE review_note END
+        WHERE id = ? AND user_id = ?
+      `,
+      [nextStatus, nextStatus, nextStatus, nextStatus, adId, user.id]
+    );
     const updated = await fetchCampaignById(adId, user.id);
     res.json({ success: true, item: mapAdRow(updated) });
   } catch (err) {
@@ -423,13 +505,17 @@ router.get("/serve", async (req, res) => {
   try {
     await ensureAdsSchemaReady();
     const placement = normalizePlacement(req.query.placement);
-    const viewerUserId = parseUserId(req.query.user_id);
+    const viewerUserId = parsePositiveInt(req.query.user_id);
     const viewerKey = buildViewerKey({ userId: viewerUserId, sessionKey: req.query.session_key });
     const [rows] = await pool.query(
       `
         ${CAMPAIGN_SELECT}
         WHERE c.placement = ?
           AND c.status = 'ACTIVE'
+          AND (
+            owner.role = 'ADMIN'
+            OR (owner.role = 'SVIP' AND (owner.role_expires_at IS NULL OR owner.role_expires_at > NOW()))
+          )
         ORDER BY c.updated_at DESC, c.id DESC
         LIMIT 12
       `,

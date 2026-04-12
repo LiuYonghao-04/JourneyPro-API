@@ -1,6 +1,6 @@
 import express from "express";
 import { pool } from "../db/connect.js";
-import { ensureAdminAccess } from "../utils/admin.js";
+import { requireAdminUser } from "../utils/accessGuard.js";
 
 const router = express.Router();
 const OVERVIEW_TTL_MS = 60 * 1000;
@@ -15,12 +15,6 @@ let overviewCache = {
 };
 let overviewInflight = null;
 
-const parseUserId = (req) => {
-  const raw = req.query.user_id ?? req.body?.user_id ?? req.get("x-user-id");
-  const uid = Number.parseInt(String(raw || ""), 10);
-  return Number.isFinite(uid) && uid > 0 ? uid : 0;
-};
-
 const safeNumber = (value) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
@@ -33,21 +27,18 @@ const oneValue = (result, key = "total") => {
   return safeNumber(row[key]);
 };
 
-async function requireAdmin(req, res, next) {
+async function tryAlter(sql) {
   try {
-    const userId = parseUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "admin user_id required" });
-    }
-    const adminUser = await ensureAdminAccess(pool, userId);
-    if (!adminUser) {
-      return res.status(403).json({ success: false, message: "admin access required" });
-    }
-    req.adminUser = adminUser;
-    return next();
+    await pool.query(sql);
   } catch (err) {
-    console.error("admin access check error", err);
-    return res.status(500).json({ success: false, message: "server error" });
+    const msg = String(err?.message || err);
+    if (
+      !msg.includes("Duplicate column name") &&
+      !msg.includes("Duplicate key name") &&
+      !msg.includes("check that column/key exists")
+    ) {
+      throw err;
+    }
   }
 }
 
@@ -194,6 +185,8 @@ async function fetchOverviewData() {
           COUNT(*) AS total_campaigns,
           SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active_campaigns,
           SUM(CASE WHEN status = 'PAUSED' THEN 1 ELSE 0 END) AS paused_campaigns,
+          SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending_campaigns,
+          SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) AS rejected_campaigns,
           COALESCE(SUM(impression_count), 0) AS impression_total,
           COALESCE(SUM(unique_viewer_count), 0) AS viewer_total
         FROM ad_campaigns
@@ -216,6 +209,23 @@ async function fetchOverviewData() {
         WHERE c.status <> 'DELETED'
         ORDER BY c.updated_at DESC, c.id DESC
         LIMIT 8
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          c.id,
+          c.title,
+          c.placement,
+          c.status,
+          c.updated_at,
+          c.created_at,
+          u.nickname
+        FROM ad_campaigns c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.status IN ('PENDING', 'REJECTED')
+        ORDER BY FIELD(c.status, 'PENDING', 'REJECTED'), c.updated_at DESC, c.id DESC
+        LIMIT 10
       `
     ),
   ]);
@@ -281,6 +291,8 @@ async function fetchOverviewData() {
       total_campaigns: safeNumber(adsSnapshot.total_campaigns),
       active_campaigns: safeNumber(adsSnapshot.active_campaigns),
       paused_campaigns: safeNumber(adsSnapshot.paused_campaigns),
+      pending_campaigns: safeNumber(adsSnapshot.pending_campaigns),
+      rejected_campaigns: safeNumber(adsSnapshot.rejected_campaigns),
       impression_total: safeNumber(adsSnapshot.impression_total),
       viewer_total: safeNumber(adsSnapshot.viewer_total),
     },
@@ -291,6 +303,13 @@ async function fetchOverviewData() {
             id: safeNumber(row.id),
             impression_count: safeNumber(row.impression_count),
             unique_viewer_count: safeNumber(row.unique_viewer_count),
+          }))
+        : [],
+    ad_review_queue:
+      settled[14]?.status === "fulfilled"
+        ? safeRows(settled[14].value).map((row) => ({
+            ...row,
+            id: safeNumber(row.id),
           }))
         : [],
     top_posts: settled[6]?.status === "fulfilled" ? safeRows(settled[6].value) : [],
@@ -307,7 +326,15 @@ async function fetchOverviewData() {
   };
 }
 
-async function getCachedOverview() {
+async function getCachedOverview(force = false) {
+  if (force) {
+    const data = await fetchOverviewData();
+    overviewCache = {
+      data,
+      expiresAt: Date.now() + OVERVIEW_TTL_MS,
+    };
+    return data;
+  }
   const now = Date.now();
   if (overviewCache.data && overviewCache.expiresAt > now) {
     return overviewCache.data;
@@ -328,9 +355,80 @@ async function getCachedOverview() {
   return overviewInflight;
 }
 
-router.get("/overview", requireAdmin, async (req, res) => {
+router.post("/integrity-sweep", requireAdminUser, async (req, res) => {
+  const adminId = Number(req.adminUser?.id) || 0;
   try {
-    const data = await getCachedOverview();
+    await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN reviewed_at DATETIME NULL`);
+    await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN reviewed_by BIGINT UNSIGNED NULL`);
+    await tryAlter(`ALTER TABLE ad_campaigns ADD COLUMN review_note VARCHAR(255) NULL`);
+    const [demotedVip] = await pool.query(
+      `
+        UPDATE users
+        SET role = 'USER', membership_updated_at = NOW()
+        WHERE role IN ('VIP', 'SVIP')
+          AND role_expires_at IS NOT NULL
+          AND role_expires_at <= NOW()
+      `
+    );
+    const [pausedAds] = await pool.query(
+      `
+        UPDATE ad_campaigns c
+        JOIN users u ON u.id = c.user_id
+        SET
+          c.status = 'PAUSED',
+          c.reviewed_at = NOW(),
+          c.reviewed_by = ?,
+          c.review_note = CASE
+            WHEN COALESCE(c.review_note, '') = '' THEN 'Paused by integrity sweep: creator no longer has active SVIP/Admin ad privileges.'
+            ELSE c.review_note
+          END
+        WHERE c.status = 'ACTIVE'
+          AND NOT (
+            u.role = 'ADMIN'
+            OR (u.role = 'SVIP' AND (u.role_expires_at IS NULL OR u.role_expires_at > NOW()))
+          )
+      `,
+      [adminId || null]
+    );
+    const [rejectedAds] = await pool.query(
+      `
+        UPDATE ad_campaigns c
+        JOIN users u ON u.id = c.user_id
+        SET
+          c.status = 'REJECTED',
+          c.reviewed_at = NOW(),
+          c.reviewed_by = ?,
+          c.review_note = CASE
+            WHEN COALESCE(c.review_note, '') = '' THEN 'Rejected by integrity sweep: creator no longer has active SVIP/Admin ad privileges.'
+            ELSE c.review_note
+          END
+        WHERE c.status = 'PENDING'
+          AND NOT (
+            u.role = 'ADMIN'
+            OR (u.role = 'SVIP' AND (u.role_expires_at IS NULL OR u.role_expires_at > NOW()))
+          )
+      `,
+      [adminId || null]
+    );
+
+    overviewCache = { expiresAt: 0, data: null };
+    res.json({
+      success: true,
+      result: {
+        memberships_demoted: safeNumber(demotedVip?.affectedRows),
+        active_ads_paused: safeNumber(pausedAds?.affectedRows),
+        pending_ads_rejected: safeNumber(rejectedAds?.affectedRows),
+      },
+    });
+  } catch (err) {
+    console.error("admin integrity sweep error", err);
+    res.status(500).json({ success: false, message: "integrity sweep failed" });
+  }
+});
+
+router.get("/overview", requireAdminUser, async (req, res) => {
+  try {
+    const data = await getCachedOverview(String(req.query.force || "") === "1");
     res.json({
       success: true,
       data: {

@@ -1,6 +1,7 @@
 import express from "express";
 import { pool } from "../db/connect.js";
 import { ensureUserAccessSchema, fetchUserAccessById, USER_ROLES, getRoleMeta } from "../utils/userAccess.js";
+import { fetchAiQuotaHistory, fetchAiQuotaStatus } from "../services/ai/quota.js";
 
 const router = express.Router();
 
@@ -189,12 +190,24 @@ router.get("/summary", async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
-    const orders = await fetchMembershipOrders(user.id, 10);
+    const [orders, aiQuota, aiUsageHistory] = await Promise.all([
+      fetchMembershipOrders(user.id, 10),
+      fetchAiQuotaStatus({ userId: user.id }),
+      fetchAiQuotaHistory({ userId: user.id, limit: 6 }),
+    ]);
     res.json({
       success: true,
       user,
       plans: formatPlans(),
       orders,
+      ai_quota: aiQuota,
+      ai_usage_history: aiUsageHistory,
+      reminders: {
+        membership_expiring_soon:
+          !!user.membership_active &&
+          Number.isFinite(Number(user.membership_days_left)) &&
+          Number(user.membership_days_left) <= 14,
+      },
     });
   } catch (err) {
     console.error("membership summary error", err);

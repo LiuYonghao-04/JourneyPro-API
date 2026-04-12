@@ -8,10 +8,8 @@ import { fileURLToPath } from "url";
 import { pool } from "./db/connect.js";
 
 import routeRouter from "./routes/route.js";
-import replanRouter from "./routes/replan.js";
 import authRouter from "./routes/auth.js";
 import postsRouter from "./routes/posts.js";
-import seedRouter from "./routes/seed.js";
 import poiRouter from "./routes/poi.js";
 import followRouter from "./routes/follow.js";
 import notificationsRouter from "./routes/notifications.js";
@@ -210,10 +208,8 @@ app.get("/api/ops/metrics", opsGuard, (_req, res) => {
 });
 
 app.use("/api/route", routeRouter);
-app.use("/api/route", replanRouter);
 app.use("/api/auth", authRouter);
 app.use("/api/posts", postsRouter);
-app.use("/api/dev", seedRouter);
 app.use("/api/poi", poiRouter);
 app.use("/api/follow", followRouter);
 app.use("/api/notifications", notificationsRouter);

@@ -172,3 +172,37 @@ export async function consumeAiQuota({
   }
 }
 
+export async function fetchAiQuotaHistory({ userId, limit = 6 } = {}) {
+  const uid = Number.parseInt(String(userId || ""), 10);
+  if (!Number.isFinite(uid) || uid <= 0) return [];
+  await ensureAiQuotaSchema();
+  const user = await fetchUserAccessById(uid);
+  if (!user) return [];
+  const roleMeta = getRoleMeta(user.role || DEFAULT_GUEST_ROLE);
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 6, 24));
+  const [rows] = await pool.query(
+    `
+      SELECT usage_month, call_count, last_called_at
+      FROM ai_usage_monthly
+      WHERE user_id = ?
+      ORDER BY usage_month DESC
+      LIMIT ?
+    `,
+    [uid, safeLimit]
+  );
+  return rows
+    .map((row) => ({
+      quota: normalizeQuotaRow({
+        roleMeta,
+        user,
+        usageMonth: String(row.usage_month || "").trim() || toUsageMonth(),
+        subjectKey: buildSubjectKey({ userId: uid }),
+        callCount: row.call_count || 0,
+      }),
+      last_called_at: row.last_called_at,
+    }))
+    .map(({ quota, last_called_at }) => ({
+      ...quota,
+      last_called_at: last_called_at ? new Date(last_called_at).toISOString() : null,
+    }));
+}
