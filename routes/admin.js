@@ -126,6 +126,98 @@ async function fetchOverviewData() {
         LIMIT 8
       `
     ),
+    pool.query(
+      `
+        SELECT
+          SUM(CASE WHEN role = 'ADMIN' THEN 1 ELSE 0 END) AS admin_total,
+          SUM(CASE WHEN role = 'SVIP' AND role_expires_at > NOW() THEN 1 ELSE 0 END) AS svip_active,
+          SUM(CASE WHEN role = 'VIP' AND role_expires_at > NOW() THEN 1 ELSE 0 END) AS vip_active,
+          SUM(CASE WHEN role IN ('VIP', 'SVIP') AND role_expires_at IS NOT NULL AND role_expires_at <= NOW() THEN 1 ELSE 0 END) AS membership_expired,
+          SUM(
+            CASE
+              WHEN role = 'USER' OR role IS NULL OR role = '' THEN 1
+              WHEN role IN ('VIP', 'SVIP') AND (role_expires_at IS NULL OR role_expires_at <= NOW()) THEN 1
+              ELSE 0
+            END
+          ) AS standard_total,
+          SUM(CASE WHEN role IN ('VIP', 'SVIP') AND role_expires_at > NOW() THEN 1 ELSE 0 END) AS paying_active
+        FROM users
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          COUNT(*) AS orders_total,
+          COALESCE(SUM(amount_cny), 0) AS revenue_total,
+          SUM(CASE WHEN created_at >= NOW() - INTERVAL 30 DAY THEN 1 ELSE 0 END) AS orders_30d,
+          COALESCE(SUM(CASE WHEN created_at >= NOW() - INTERVAL 30 DAY THEN amount_cny ELSE 0 END), 0) AS revenue_30d
+        FROM membership_orders
+        WHERE status = 'PAID'
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          mo.id,
+          mo.user_id,
+          mo.role_after,
+          mo.billing_cycle,
+          mo.amount_cny,
+          mo.created_at,
+          mo.expires_after,
+          u.nickname
+        FROM membership_orders mo
+        LEFT JOIN users u ON u.id = mo.user_id
+        WHERE mo.status = 'PAID'
+        ORDER BY mo.id DESC
+        LIMIT 8
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          id,
+          nickname,
+          role,
+          role_expires_at
+        FROM users
+        WHERE role IN ('VIP', 'SVIP')
+          AND role_expires_at IS NOT NULL
+          AND role_expires_at > NOW()
+        ORDER BY role_expires_at ASC, id ASC
+        LIMIT 8
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          COUNT(*) AS total_campaigns,
+          SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active_campaigns,
+          SUM(CASE WHEN status = 'PAUSED' THEN 1 ELSE 0 END) AS paused_campaigns,
+          COALESCE(SUM(impression_count), 0) AS impression_total,
+          COALESCE(SUM(unique_viewer_count), 0) AS viewer_total
+        FROM ad_campaigns
+        WHERE status <> 'DELETED'
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          c.id,
+          c.title,
+          c.placement,
+          c.status,
+          c.impression_count,
+          c.unique_viewer_count,
+          c.updated_at,
+          u.nickname
+        FROM ad_campaigns c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.status <> 'DELETED'
+        ORDER BY c.updated_at DESC, c.id DESC
+        LIMIT 8
+      `
+    ),
   ]);
 
   const approxMap = settled[3]?.status === "fulfilled" ? settled[3].value : new Map();
@@ -133,6 +225,9 @@ async function fetchOverviewData() {
   const exactFollowTotal = settled[5]?.status === "fulfilled" ? oneValue(settled[5].value) : 0;
   const totalPosts = safeNumber(postSnapshot.post_total);
   const poiLinkedPosts = safeNumber(postSnapshot.poi_linked_posts);
+  const roleSnapshot = settled[8]?.status === "fulfilled" ? safeRows(settled[8].value)?.[0] || {} : {};
+  const membershipSnapshot = settled[9]?.status === "fulfilled" ? safeRows(settled[9].value)?.[0] || {} : {};
+  const adsSnapshot = settled[12]?.status === "fulfilled" ? safeRows(settled[12].value)?.[0] || {} : {};
 
   return {
     totals: {
@@ -153,6 +248,51 @@ async function fetchOverviewData() {
       avg_views_per_post: Math.round(safeNumber(postSnapshot.avg_views) * 10) / 10,
       poi_link_rate: totalPosts > 0 ? Math.round((poiLinkedPosts * 100) / totalPosts) : 0,
     },
+    role_breakdown: {
+      admin: safeNumber(roleSnapshot.admin_total),
+      svip: safeNumber(roleSnapshot.svip_active),
+      vip: safeNumber(roleSnapshot.vip_active),
+      standard: safeNumber(roleSnapshot.standard_total),
+      expired_memberships: safeNumber(roleSnapshot.membership_expired),
+      paying_active: safeNumber(roleSnapshot.paying_active),
+    },
+    membership_metrics: {
+      orders_total: safeNumber(membershipSnapshot.orders_total),
+      revenue_total: safeNumber(membershipSnapshot.revenue_total),
+      orders_30d: safeNumber(membershipSnapshot.orders_30d),
+      revenue_30d: safeNumber(membershipSnapshot.revenue_30d),
+    },
+    recent_membership_orders:
+      settled[10]?.status === "fulfilled"
+        ? safeRows(settled[10].value).map((row) => ({
+            ...row,
+            amount_cny: safeNumber(row.amount_cny),
+            user_id: safeNumber(row.user_id),
+          }))
+        : [],
+    expiring_memberships:
+      settled[11]?.status === "fulfilled"
+        ? safeRows(settled[11].value).map((row) => ({
+            ...row,
+            id: safeNumber(row.id),
+          }))
+        : [],
+    ads_metrics: {
+      total_campaigns: safeNumber(adsSnapshot.total_campaigns),
+      active_campaigns: safeNumber(adsSnapshot.active_campaigns),
+      paused_campaigns: safeNumber(adsSnapshot.paused_campaigns),
+      impression_total: safeNumber(adsSnapshot.impression_total),
+      viewer_total: safeNumber(adsSnapshot.viewer_total),
+    },
+    recent_ads:
+      settled[13]?.status === "fulfilled"
+        ? safeRows(settled[13].value).map((row) => ({
+            ...row,
+            id: safeNumber(row.id),
+            impression_count: safeNumber(row.impression_count),
+            unique_viewer_count: safeNumber(row.unique_viewer_count),
+          }))
+        : [],
     top_posts: settled[6]?.status === "fulfilled" ? safeRows(settled[6].value) : [],
     active_users:
       settled[7]?.status === "fulfilled"

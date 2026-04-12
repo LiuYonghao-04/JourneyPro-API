@@ -30,7 +30,27 @@ const safeJsonParse = (value, fallback = null) => {
   }
 };
 
+const tryAlter = async (sql) => {
+  try {
+    await pool.query(sql);
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (
+      !msg.includes("Duplicate column name") &&
+      !msg.includes("Duplicate key name") &&
+      !msg.includes("check that column/key exists")
+    ) {
+      throw err;
+    }
+  }
+};
+
 const normalizeSnapshot = (value) => {
+  const parsed = safeJsonParse(value, null);
+  return parsed && typeof parsed === "object" ? parsed : null;
+};
+
+const normalizeCompletionReport = (value) => {
   const parsed = safeJsonParse(value, null);
   return parsed && typeof parsed === "object" ? parsed : null;
 };
@@ -70,6 +90,97 @@ const buildDefaultTitle = (snapshot) => {
   if (prompt) return truncate(prompt, 84);
   if (summary) return truncate(summary, 84);
   return "Untitled trip workspace";
+};
+
+const buildTripCompletionArtifacts = ({ snapshot, routeContext, notesText }) => {
+  const safeSnapshot = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const safeRouteContext = routeContext && typeof routeContext === "object" ? routeContext : null;
+  const safeNotes = String(notesText || "").trim();
+  const recommendationList = Array.isArray(safeSnapshot?.recommendations) ? safeSnapshot.recommendations : [];
+  const savedPois = extractSavedPois(safeSnapshot, safeRouteContext);
+  const linkedPosts = extractLinkedPosts(safeSnapshot);
+  const topStops = (savedPois.length ? savedPois : recommendationList)
+    .slice(0, 4)
+    .map((item, index) => ({
+      order: index + 1,
+      id: item?.id ?? null,
+      name: truncate(item?.name, 120) || "POI",
+      category: truncate(item?.category, 60) || "",
+      distance_m: Number(item?.distance_m) || 0,
+      detour_duration_s: Number(item?.detour_duration_s) || 0,
+    }));
+  const categoryCounts = new Map();
+  topStops.forEach((stop) => {
+    const key = String(stop.category || "").trim().toLowerCase();
+    if (!key) return;
+    categoryCounts.set(key, (categoryCounts.get(key) || 0) + 1);
+  });
+  const focusCategories = [...categoryCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 3)
+    .map(([category]) => category);
+  const routeMeta = safeSnapshot?.route_meta && typeof safeSnapshot.route_meta === "object" ? safeSnapshot.route_meta : null;
+  const distanceKm = Number(routeMeta?.distance_m || 0) > 0 ? Number(routeMeta.distance_m) / 1000 : 0;
+  const durationMin = Number(routeMeta?.duration_s || 0) > 0 ? Math.round(Number(routeMeta.duration_s) / 60) : 0;
+  const pace = String(safeSnapshot?.planner_intent?.pace || "").trim() || "balanced";
+  const archetype = truncate(safeSnapshot?.profile_snapshot?.archetype, 80) || "";
+  const highlights = [];
+  if (topStops.length) {
+    highlights.push(`Completed with ${topStops.length} saved stop${topStops.length > 1 ? "s" : ""} ready for reuse.`);
+  }
+  if (focusCategories.length) {
+    highlights.push(`Primary focus categories: ${focusCategories.join(", ")}.`);
+  }
+  if (distanceKm > 0 || durationMin > 0) {
+    highlights.push(`Planned route footprint: ${distanceKm > 0 ? `${distanceKm.toFixed(1)} km` : "N/A"} and ${durationMin || 0} min.`);
+  }
+  if (linkedPosts.length) {
+    highlights.push(`Grounded by ${linkedPosts.length} linked communit${linkedPosts.length > 1 ? "y stories" : "y story"}.`);
+  }
+  if (safeNotes) {
+    const firstLine = safeNotes.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (firstLine) {
+      highlights.push(`Note captured: ${truncate(firstLine, 120)}`);
+    }
+  }
+  if (archetype) {
+    highlights.push(`Profile snapshot: ${archetype}.`);
+  }
+
+  const headline =
+    truncate(
+      `${pace.charAt(0).toUpperCase() + pace.slice(1)} London trip wrapped with ${topStops.length || recommendationList.length || 0} highlighted stops.`,
+      140
+    ) || "Trip completed.";
+  const overview =
+    truncate(
+      extractSummary(safeSnapshot) ||
+        `JourneyPro archived this workspace as a completed trip with ${focusCategories.join(", ") || "route-aware"} focus.`,
+      220
+    ) || "JourneyPro archived this workspace as a completed trip.";
+
+  return {
+    completionSummary: truncate(
+      `${headline}${focusCategories.length ? ` Focus: ${focusCategories.join(", ")}.` : ""}${linkedPosts.length ? ` Stories linked: ${linkedPosts.length}.` : ""}`,
+      255
+    ),
+    completionReport: {
+      headline,
+      overview,
+      pace,
+      archetype,
+      focus_categories: focusCategories,
+      top_stops: topStops,
+      highlights: highlights.slice(0, 6),
+      metrics: {
+        stop_count: topStops.length || recommendationList.length || 0,
+        linked_story_count: linkedPosts.length,
+        route_distance_km: distanceKm ? Number(distanceKm.toFixed(1)) : 0,
+        route_duration_min: durationMin || 0,
+      },
+      note_excerpt: safeNotes ? truncate(safeNotes, 180) : "",
+    },
+  };
 };
 
 const normalizeRouteContext = (snapshot) => {
@@ -348,6 +459,7 @@ const buildListRow = (row) => {
       (Array.isArray(snapshot?.recommendations) && snapshot.recommendations.length > 0),
     intent_snapshot: extractIntentSnapshot(snapshot),
     profile_snapshot: extractProfileSnapshot(snapshot, routeContext),
+    completion_summary: String(row.completion_summary || "").trim(),
     created_at: row.created_at,
     updated_at: row.updated_at,
     started_at: row.started_at,
@@ -373,6 +485,8 @@ async function ensureTripsTable() {
       notes_text MEDIUMTEXT NULL,
       planner_snapshot_json MEDIUMTEXT NOT NULL,
       route_context_json MEDIUMTEXT NULL,
+      completion_summary VARCHAR(255) NULL,
+      completion_report_json MEDIUMTEXT NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       started_at DATETIME NULL,
@@ -382,6 +496,8 @@ async function ensureTripsTable() {
       KEY idx_trip_workspaces_user_starred (user_id, is_starred, updated_at)
     )
   `);
+  await tryAlter(`ALTER TABLE trip_workspaces ADD COLUMN completion_summary VARCHAR(255) NULL`);
+  await tryAlter(`ALTER TABLE trip_workspaces ADD COLUMN completion_report_json MEDIUMTEXT NULL`);
 }
 
 function ensureTripsTableReady() {
@@ -403,7 +519,8 @@ async function fetchTripListRowById(tripId) {
   const [[row]] = await pool.query(
     `
       SELECT tw.id, tw.user_id, tw.source_plan_id, tw.title, tw.summary, tw.prompt_preview, tw.status, tw.progress_state,
-             tw.note_count, tw.stop_count, tw.via_count, tw.is_starred, tw.planner_snapshot_json, tw.route_context_json,
+             tw.note_count, tw.stop_count, tw.via_count, tw.is_starred, tw.notes_text, tw.planner_snapshot_json, tw.route_context_json,
+             tw.completion_summary, tw.completion_report_json,
              tw.created_at, tw.updated_at, tw.started_at, tw.completed_at, COALESCE(ap.title, '') AS source_plan_title
       FROM trip_workspaces tw
       LEFT JOIN ai_trip_plans ap ON ap.id = tw.source_plan_id
@@ -454,6 +571,7 @@ router.get("/trips", async (req, res) => {
       `
         SELECT tw.id, tw.user_id, tw.source_plan_id, tw.title, tw.summary, tw.prompt_preview, tw.status, tw.progress_state,
                tw.note_count, tw.stop_count, tw.via_count, tw.is_starred, tw.planner_snapshot_json, tw.route_context_json,
+               tw.completion_summary, tw.completion_report_json,
                tw.created_at, tw.updated_at, tw.started_at, tw.completed_at, COALESCE(ap.title, '') AS source_plan_title
         FROM trip_workspaces tw
         LEFT JOIN ai_trip_plans ap ON ap.id = tw.source_plan_id
@@ -511,6 +629,7 @@ router.get("/trips/:id", async (req, res) => {
         notes_text: String(row.notes_text || ""),
         planner_snapshot: normalizeSnapshot(row.planner_snapshot_json),
         route_context: safeJsonParse(row.route_context_json, null),
+        completion_report: normalizeCompletionReport(row.completion_report_json),
         saved_pois: extractSavedPois(normalizeSnapshot(row.planner_snapshot_json), safeJsonParse(row.route_context_json, null)),
         linked_posts: extractLinkedPosts(normalizeSnapshot(row.planner_snapshot_json)),
       },
@@ -549,15 +668,20 @@ router.post("/trips", async (req, res) => {
     const stopCount = clamp(Array.isArray(snapshot?.recommendations) ? snapshot.recommendations.length : 0, 0, 50);
     const viaCount = clamp(Array.isArray(routeContext?.via) ? routeContext.via.length : 0, 0, 32);
     const noteCount = notesText ? notesText.split(/\r?\n/).filter((line) => String(line || "").trim()).length : 0;
+    const completionArtifacts =
+      status === "COMPLETED"
+        ? buildTripCompletionArtifacts({ snapshot, routeContext, notesText })
+        : { completionSummary: null, completionReport: null };
 
     const [result] = await pool.query(
       `
         INSERT INTO trip_workspaces (
           user_id, source_plan_id, title, summary, prompt_preview, status, progress_state,
           note_count, stop_count, via_count, notes_text, planner_snapshot_json, route_context_json,
+          completion_summary, completion_report_json,
           started_at, completed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         userId,
@@ -573,6 +697,8 @@ router.post("/trips", async (req, res) => {
         notesText || null,
         JSON.stringify(snapshot),
         routeContext ? JSON.stringify(routeContext) : null,
+        completionArtifacts.completionSummary || null,
+        completionArtifacts.completionReport ? JSON.stringify(completionArtifacts.completionReport) : null,
         status === "ACTIVE" ? new Date() : null,
         status === "COMPLETED" ? new Date() : null,
       ]
@@ -582,6 +708,7 @@ router.post("/trips", async (req, res) => {
       `
         SELECT tw.id, tw.user_id, tw.source_plan_id, tw.title, tw.summary, tw.prompt_preview, tw.status, tw.progress_state,
                tw.note_count, tw.stop_count, tw.via_count, tw.is_starred, tw.planner_snapshot_json, tw.route_context_json,
+               tw.completion_summary, tw.completion_report_json,
                tw.created_at, tw.updated_at, tw.started_at, tw.completed_at, COALESCE(ap.title, '') AS source_plan_title
         FROM trip_workspaces tw
         LEFT JOIN ai_trip_plans ap ON ap.id = tw.source_plan_id
@@ -656,9 +783,10 @@ router.post("/trips/attach-community", async (req, res) => {
         `
           INSERT INTO trip_workspaces (
             user_id, title, summary, prompt_preview, status, progress_state,
-            note_count, stop_count, via_count, notes_text, planner_snapshot_json, route_context_json
+            note_count, stop_count, via_count, notes_text, planner_snapshot_json, route_context_json,
+            completion_summary, completion_report_json
           )
-          VALUES (?, ?, ?, ?, 'DRAFT', 'PLANNING', 0, ?, ?, NULL, ?, ?)
+          VALUES (?, ?, ?, ?, 'DRAFT', 'PLANNING', 0, ?, ?, NULL, ?, ?, NULL, NULL)
         `,
         [
           userId,
@@ -732,9 +860,17 @@ router.patch("/trips/:id", async (req, res) => {
     if (!exists) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
+    const current = await fetchTripListRowById(tripId);
+    if (!current || Number(current.user_id) !== Number(userId)) {
+      return res.status(404).json({ success: false, message: "trip not found" });
+    }
 
     const fields = [];
     const params = [];
+    let nextStatus = String(current.status || "DRAFT").trim().toUpperCase();
+    let nextNotesText = String(current.notes_text || "").trim();
+    let nextSnapshot = normalizeSnapshot(current.planner_snapshot_json);
+    let nextRouteContext = safeJsonParse(current.route_context_json, null);
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, "title")) {
       fields.push("title = ?");
@@ -753,18 +889,20 @@ router.patch("/trips/:id", async (req, res) => {
       const noteCount = notesText ? notesText.split(/\r?\n/).filter((line) => String(line || "").trim()).length : 0;
       fields.push("notes_text = ?", "note_count = ?");
       params.push(notesText || null, noteCount);
+      nextNotesText = notesText;
     }
     if (Object.prototype.hasOwnProperty.call(req.body || {}, "status")) {
       const status = normalizeStatus(req.body?.status, "DRAFT");
       const progressState = status === "COMPLETED" ? "DONE" : status === "ACTIVE" ? "IN_PROGRESS" : "PLANNING";
       fields.push("status = ?", "progress_state = ?");
       params.push(status, progressState);
+      nextStatus = status;
       if (status === "ACTIVE") {
-        fields.push("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)", "completed_at = NULL");
+        fields.push("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)", "completed_at = NULL", "completion_summary = NULL", "completion_report_json = NULL");
       } else if (status === "COMPLETED") {
         fields.push("completed_at = CURRENT_TIMESTAMP");
       } else {
-        fields.push("completed_at = NULL");
+        fields.push("completed_at = NULL", "completion_summary = NULL", "completion_report_json = NULL");
       }
     }
     if (Object.prototype.hasOwnProperty.call(req.body || {}, "planner_snapshot")) {
@@ -780,6 +918,21 @@ router.patch("/trips/:id", async (req, res) => {
         extractPrompt(snapshot) || null,
         clamp(Array.isArray(snapshot?.recommendations) ? snapshot.recommendations.length : 0, 0, 50),
         clamp(Array.isArray(routeContext?.via) ? routeContext.via.length : 0, 0, 32)
+      );
+      nextSnapshot = snapshot;
+      nextRouteContext = routeContext;
+    }
+
+    if (nextStatus === "COMPLETED") {
+      const completionArtifacts = buildTripCompletionArtifacts({
+        snapshot: nextSnapshot,
+        routeContext: nextRouteContext,
+        notesText: nextNotesText,
+      });
+      fields.push("completion_summary = ?", "completion_report_json = ?");
+      params.push(
+        completionArtifacts.completionSummary || null,
+        completionArtifacts.completionReport ? JSON.stringify(completionArtifacts.completionReport) : null
       );
     }
 
@@ -805,6 +958,7 @@ router.patch("/trips/:id", async (req, res) => {
       `
         SELECT tw.id, tw.user_id, tw.source_plan_id, tw.title, tw.summary, tw.prompt_preview, tw.status, tw.progress_state,
                tw.note_count, tw.stop_count, tw.via_count, tw.is_starred, tw.planner_snapshot_json, tw.route_context_json,
+               tw.completion_summary, tw.completion_report_json,
                tw.created_at, tw.updated_at, tw.started_at, tw.completed_at, COALESCE(ap.title, '') AS source_plan_title
         FROM trip_workspaces tw
         LEFT JOIN ai_trip_plans ap ON ap.id = tw.source_plan_id

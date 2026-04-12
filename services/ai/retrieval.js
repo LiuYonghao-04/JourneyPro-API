@@ -105,9 +105,10 @@ const buildInsightLines = ({ posts, comments, routePois }) => {
   return lines.slice(0, 5);
 };
 
-const mapPostCard = (post, score, rank) => ({
+const mapPostCard = (post, score, rank, citationLabel) => ({
   source_id: `post:${post.id}`,
   rank,
+  citation_label: citationLabel || `P${rank}`,
   type: "post",
   post_id: post.id,
   poi_id: post.poi_id,
@@ -127,9 +128,10 @@ const mapPostCard = (post, score, rank) => ({
   score: Number(score.toFixed(6)),
 });
 
-const mapCommentCard = (comment, score, rank) => ({
+const mapCommentCard = (comment, score, rank, citationLabel) => ({
   source_id: `comment:${comment.id}`,
   rank,
+  citation_label: citationLabel || `C${rank}`,
   type: "comment",
   comment_id: comment.id,
   post_id: comment.post_id,
@@ -147,9 +149,10 @@ const mapCommentCard = (comment, score, rank) => ({
   score: Number(score.toFixed(6)),
 });
 
-const mapPoiCard = (poi, rank) => ({
+const mapPoiCard = (poi, rank, citationLabel) => ({
   source_id: `poi:${poi.id}`,
   rank,
+  citation_label: citationLabel || `R${rank}`,
   type: "poi",
   poi_id: poi.id,
   title: poi.name || "POI",
@@ -444,10 +447,12 @@ export const buildPlannerKnowledgePack = async ({ prompt, rankedItems, promptPoi
     .map((id) => promptPois.find((poi) => Number(poi.id) === Number(id)) || routePois.find((poi) => Number(poi.id) === Number(id)))
     .filter(Boolean)
     .slice(0, 6)
-    .map((poi, index) => mapPoiCard(poi, index + 1));
+    .map((poi, index) => mapPoiCard(poi, index + 1, `R${index + 1}`));
 
-  const postCards = selectedPosts.map((post, index) => mapPostCard(post, post._score, index + 1));
-  const commentCards = selectedComments.map((comment, index) => mapCommentCard(comment, comment._score, index + 1));
+  const postCards = selectedPosts.map((post, index) => mapPostCard(post, post._score, index + 1, `P${index + 1}`));
+  const commentCards = selectedComments.map((comment, index) =>
+    mapCommentCard(comment, comment._score, index + 1, `C${index + 1}`)
+  );
   const insights = buildInsightLines({
     posts: selectedPosts,
     comments: selectedComments,
