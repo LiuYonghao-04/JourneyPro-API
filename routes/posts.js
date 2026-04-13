@@ -3,6 +3,7 @@ import { pool } from "../db/connect.js";
 import { createNotificationEvent, pushNotification } from "./notifications.js";
 import { insertRecommendationEvents } from "../services/reco/events.js";
 import { requireAdminUser } from "../utils/accessGuard.js";
+import { ensurePostModerationSchema } from "../utils/socialSchema.js";
 
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
@@ -1669,6 +1670,7 @@ router.get("/tags/list", async (_req, res) => {
 router.post("/:id/report", async (req, res) => {
   try {
     await ensureTablesReady();
+    await ensurePostModerationSchema();
     const postId = parseInt(req.params.id, 10);
     const reporterUserId = parseInt(req.body?.user_id || req.query?.user_id || "0", 10);
     const reason = String(req.body?.reason || "").trim().slice(0, 40);
@@ -1716,6 +1718,7 @@ router.post("/:id/report", async (req, res) => {
 router.post("/:id/moderate", requireAdminUser, async (req, res) => {
   try {
     await ensureTablesReady();
+    await ensurePostModerationSchema();
     const postId = parseInt(req.params.id, 10);
     if (!postId) {
       return res.status(400).json({ success: false, message: "invalid post id" });

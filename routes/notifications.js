@@ -1,5 +1,6 @@
 import express from "express";
 import { pool } from "../db/connect.js";
+import { ensureNotificationSchema } from "../utils/socialSchema.js";
 
 const router = express.Router();
 const subscribers = new Map(); // userId -> Set(res)
@@ -178,7 +179,7 @@ async function ensureTables() {
 let ensureTablesPromise = null;
 function ensureTablesReady() {
   if (!ensureTablesPromise) {
-    ensureTablesPromise = ensureTables().catch((err) => {
+    ensureTablesPromise = Promise.all([ensureTables(), ensureNotificationSchema()]).catch((err) => {
       ensureTablesPromise = null;
       throw err;
     });
