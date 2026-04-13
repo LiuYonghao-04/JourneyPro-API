@@ -131,6 +131,24 @@ async function ensureMembershipSchema() {
       KEY idx_membership_orders_role_after (role_after, created_at)
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallet_ledger (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      direction VARCHAR(20) NOT NULL DEFAULT 'DEBIT',
+      amount_cny DECIMAL(10,2) NOT NULL DEFAULT 0,
+      balance_before_cny DECIMAL(10,2) NOT NULL DEFAULT 0,
+      balance_after_cny DECIMAL(10,2) NOT NULL DEFAULT 0,
+      entry_type VARCHAR(40) NOT NULL DEFAULT 'MEMBERSHIP_PURCHASE',
+      reference_type VARCHAR(40) NULL,
+      reference_id BIGINT UNSIGNED NULL,
+      note VARCHAR(255) NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_wallet_ledger_user_created (user_id, created_at),
+      KEY idx_wallet_ledger_entry_type (entry_type, created_at)
+    )
+  `);
   await tryAlter(`ALTER TABLE membership_orders ADD COLUMN balance_before_cny DECIMAL(10,2) NOT NULL DEFAULT 0`);
   await tryAlter(`ALTER TABLE membership_orders ADD COLUMN balance_after_cny DECIMAL(10,2) NOT NULL DEFAULT 0`);
   await tryAlter(`ALTER TABLE users ADD COLUMN role_expires_at DATETIME NULL`);
@@ -179,6 +197,42 @@ async function fetchMembershipOrders(userId, limit = 12) {
   }));
 }
 
+async function fetchWalletLedger(userId, limit = 16) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 16, 60));
+  const [rows] = await pool.query(
+    `
+      SELECT
+        id,
+        direction,
+        amount_cny,
+        balance_before_cny,
+        balance_after_cny,
+        entry_type,
+        reference_type,
+        reference_id,
+        note,
+        created_at
+      FROM wallet_ledger
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `,
+    [userId, safeLimit]
+  );
+  return rows.map((row) => ({
+    id: Number(row.id),
+    direction: String(row.direction || "DEBIT").trim().toUpperCase(),
+    amount_cny: Number(row.amount_cny) || 0,
+    balance_before_cny: Number(row.balance_before_cny) || 0,
+    balance_after_cny: Number(row.balance_after_cny) || 0,
+    entry_type: String(row.entry_type || "MEMBERSHIP_PURCHASE").trim().toUpperCase(),
+    reference_type: String(row.reference_type || "").trim().toUpperCase(),
+    reference_id: row.reference_id ? Number(row.reference_id) : null,
+    note: String(row.note || "").trim(),
+    created_at: toIso(row.created_at),
+  }));
+}
+
 router.get("/summary", async (req, res) => {
   try {
     await ensureMembershipSchemaReady();
@@ -190,8 +244,9 @@ router.get("/summary", async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
-    const [orders, aiQuota, aiUsageHistory] = await Promise.all([
+    const [orders, walletLedger, aiQuota, aiUsageHistory] = await Promise.all([
       fetchMembershipOrders(user.id, 10),
+      fetchWalletLedger(user.id, 12),
       fetchAiQuotaStatus({ userId: user.id }),
       fetchAiQuotaHistory({ userId: user.id, limit: 6 }),
     ]);
@@ -200,6 +255,7 @@ router.get("/summary", async (req, res) => {
       user,
       plans: formatPlans(),
       orders,
+      wallet_ledger: walletLedger,
       ai_quota: aiQuota,
       ai_usage_history: aiUsageHistory,
       reminders: {
@@ -207,6 +263,7 @@ router.get("/summary", async (req, res) => {
           !!user.membership_active &&
           Number.isFinite(Number(user.membership_days_left)) &&
           Number(user.membership_days_left) <= 14,
+        wallet_low_balance: Number(user.balance_cny || 0) <= 5,
       },
     });
   } catch (err) {
@@ -317,11 +374,38 @@ router.post("/purchase", async (req, res) => {
         nextExpiry,
       ]
     );
+    await conn.query(
+      `
+        INSERT INTO wallet_ledger (
+          user_id,
+          direction,
+          amount_cny,
+          balance_before_cny,
+          balance_after_cny,
+          entry_type,
+          reference_type,
+          reference_id,
+          note
+        )
+        VALUES (?, 'DEBIT', ?, ?, ?, 'MEMBERSHIP_PURCHASE', 'MEMBERSHIP_ORDER', ?, ?)
+      `,
+      [
+        userId,
+        amount,
+        balanceBefore,
+        balanceAfter,
+        orderResult.insertId,
+        `${getRoleMeta(targetRole).label} ${cycle.label} membership purchase`,
+      ]
+    );
 
     await conn.commit();
 
     const refreshedUser = await fetchUserAccessById(userId);
-    const orders = await fetchMembershipOrders(userId, 10);
+    const [orders, walletLedger] = await Promise.all([
+      fetchMembershipOrders(userId, 10),
+      fetchWalletLedger(userId, 12),
+    ]);
     const [latestRows] = await pool.query(
       `
         SELECT id, role_before, role_after, billing_cycle, months_paid, amount_cny,
@@ -356,6 +440,7 @@ router.post("/purchase", async (req, res) => {
       order: latestOrder,
       plans: formatPlans(),
       orders,
+      wallet_ledger: walletLedger,
       purchased_plan: {
         role: targetRole,
         role_label: getRoleMeta(targetRole).label,

@@ -871,6 +871,190 @@ const tuneWeightsByIntent = ({ baseInterestWeight, baseExploreWeight, intent }) 
   };
 };
 
+const normalizeConversationMessages = (list) =>
+  (Array.isArray(list) ? list : [])
+    .map((item) => ({
+      role: item?.role === "assistant" ? "assistant" : "user",
+      content: String(item?.content || "").replace(/\s+/g, " ").trim().slice(0, 600),
+    }))
+    .filter((item) => item.content)
+    .slice(-8);
+
+const normalizeTripMemoryPois = (list, limit = 8) =>
+  (Array.isArray(list) ? list : [])
+    .map((item, index) => ({
+      id: item?.id ?? item?.poi_id ?? null,
+      name: String(item?.name || item?.label || item?.poi_name || "").trim().slice(0, 120),
+      category: String(item?.category || "").trim().toLowerCase(),
+      lat: Number(item?.lat),
+      lng: Number(item?.lng),
+      order: Number(item?.order || index + 1) || index + 1,
+    }))
+    .filter((item) => item.name || item.id !== null)
+    .slice(0, limit);
+
+const buildTripMemoryContext = (raw) => {
+  const visitedTargets = normalizeTripMemoryPois(raw?.visited_targets, 12);
+  const skippedTargets = normalizeTripMemoryPois(raw?.skipped_targets, 12);
+  const savedPois = normalizeTripMemoryPois(raw?.saved_pois, 12);
+  const recentPois = normalizeTripMemoryPois(raw?.recent_pois, 12);
+  const currentTarget =
+    raw?.current_target && typeof raw.current_target === "object"
+      ? normalizeTripMemoryPois([raw.current_target], 1)[0] || null
+      : null;
+
+  return {
+    executionMode: !!raw?.execution_mode,
+    executionCompleted: !!raw?.execution_completed,
+    visitedTargets,
+    skippedTargets,
+    savedPois,
+    recentPois,
+    currentTarget,
+  };
+};
+
+const buildCombinedIntentPrompt = (prompt, conversation) => {
+  const history = normalizeConversationMessages(conversation)
+    .filter((item) => item.role === "user")
+    .map((item) => item.content)
+    .filter(Boolean);
+  const current = String(prompt || "").trim();
+  const combined = [...history.slice(-4), current].filter(Boolean).join(" \n ");
+  return combined || current;
+};
+
+const buildTripMemoryAdjustment = (item, tripMemory) => {
+  const reasons = [];
+  let delta = 0;
+  const category = String(item?.category || "").trim().toLowerCase();
+  const id = item?.id ?? null;
+  const name = normalizeText(item?.name || "");
+  const saved = Array.isArray(tripMemory?.savedPois) ? tripMemory.savedPois : [];
+  const visited = Array.isArray(tripMemory?.visitedTargets) ? tripMemory.visitedTargets : [];
+  const skipped = Array.isArray(tripMemory?.skippedTargets) ? tripMemory.skippedTargets : [];
+
+  const matchesMemory = (entry) => {
+    const entryName = normalizeText(entry?.name || "");
+    return (
+      (id !== null && entry?.id !== null && Number(entry.id) === Number(id)) ||
+      (!!category && String(entry?.category || "").trim().toLowerCase() === category) ||
+      (!!name && !!entryName && entryName === name)
+    );
+  };
+
+  if (saved.some(matchesMemory)) {
+    delta += 0.08;
+    reasons.push("aligned with saved place history");
+  }
+  if (visited.some(matchesMemory)) {
+    delta -= 0.12;
+    reasons.push("already covered in this trip");
+  }
+  if (skipped.some(matchesMemory)) {
+    delta -= 0.16;
+    reasons.push("deprioritized after skipped stop");
+  }
+
+  return { delta, reasons };
+};
+
+const inferBudgetBand = (text) => {
+  const source = normalizeText(text);
+  if (!source) return "flexible";
+  if (/(budget|cheap|affordable|student|low cost|save money)/i.test(source)) return "budget";
+  if (/(luxury|premium|fine dining|high end|splurge)/i.test(source)) return "premium";
+  return "standard";
+};
+
+const buildPlannerStructuredGuide = ({ prompt, items, intent, tripMemory, route }) => {
+  const ranked = Array.isArray(items) ? items : [];
+  const budgetBand = inferBudgetBand(prompt);
+  const weatherMode = intent?.hasRainSignal ? "rainy-day" : "standard";
+  const visitedCount = Array.isArray(tripMemory?.visitedTargets) ? tripMemory.visitedTargets.length : 0;
+  const skippedCount = Array.isArray(tripMemory?.skippedTargets) ? tripMemory.skippedTargets.length : 0;
+  const savedCount = Array.isArray(tripMemory?.savedPois) ? tripMemory.savedPois.length : 0;
+  const primaryStops = ranked.slice(0, 3);
+  const alternativeStops = ranked
+    .slice(3)
+    .filter((item, index, list) => list.findIndex((other) => other?.category === item?.category) === index)
+    .slice(0, 3)
+    .map((item, index) => ({
+      order: index + 1,
+      id: item?.id ?? null,
+      name: item?.name || "Alternative stop",
+      category: item?.category || "poi",
+      detour_duration_s: Number(item?.detour_duration_s || 0),
+      distance_m: Number(item?.distance_m || 0),
+    }));
+
+  const rainyDayNote = weatherMode === "rainy-day"
+    ? "Lean into indoor stops and covered museum/gallery options."
+    : "Weather is neutral, so outdoor and indoor stops can stay mixed.";
+  const continuityNote =
+    visitedCount || skippedCount || savedCount
+      ? `Trip memory detected: ${visitedCount} visited, ${skippedCount} skipped, ${savedCount} saved places already influence this draft.`
+      : "No prior in-trip memory yet, so this draft is based on route and community evidence only.";
+
+  return {
+    budget_band: budgetBand,
+    weather_mode: weatherMode,
+    pace: intent?.pace || "balanced",
+    primary_focus: primaryStops.map((item) => item?.name).filter(Boolean),
+    alternatives: alternativeStops,
+    rainy_day_note: rainyDayNote,
+    continuity_note: continuityNote,
+    route_strategy: route?.distance
+      ? `Route-aware selection across ${toKm(route.distance)} with ${toMin(route.duration)} total drive time.`
+      : "Route-aware selection based on current start/end context.",
+  };
+};
+
+const buildPlannerAugmentedPromptContext = ({ knowledgePack, tripMemory, structuredGuide, conversation }) => {
+  const parts = [String(knowledgePack?.prompt_context || "").trim()];
+  const convo = normalizeConversationMessages(conversation);
+  if (convo.length) {
+    parts.push(
+      `Conversation memory:\n${convo
+        .map((item) => `${item.role === "assistant" ? "Planner" : "User"}: ${item.content}`)
+        .join("\n")}`
+    );
+  }
+  if (tripMemory?.savedPois?.length || tripMemory?.visitedTargets?.length || tripMemory?.skippedTargets?.length) {
+    parts.push(
+      [
+        "Trip memory:",
+        tripMemory.savedPois?.length
+          ? `Saved places: ${tripMemory.savedPois.slice(0, 5).map((item) => item.name || item.category).join(", ")}`
+          : "",
+        tripMemory.visitedTargets?.length
+          ? `Visited this trip: ${tripMemory.visitedTargets.slice(0, 5).map((item) => item.name || item.category).join(", ")}`
+          : "",
+        tripMemory.skippedTargets?.length
+          ? `Skipped this trip: ${tripMemory.skippedTargets.slice(0, 5).map((item) => item.name || item.category).join(", ")}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  }
+  if (structuredGuide) {
+    parts.push(
+      [
+        "Planner structure hints:",
+        `Budget: ${structuredGuide.budget_band}`,
+        `Weather mode: ${structuredGuide.weather_mode}`,
+        `Pace: ${structuredGuide.pace}`,
+        structuredGuide.rainy_day_note,
+        structuredGuide.continuity_note,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  }
+  return parts.filter(Boolean).join("\n\n");
+};
+
 const safeNumber = (value, fallback = 0) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -1108,7 +1292,7 @@ const selectDiversifiedItems = ({ candidates, intent, outputLimit }) => {
   return selected;
 };
 
-const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLimit }) => {
+const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLimit, tripMemory }) => {
   const withScore = (Array.isArray(items) ? items : []).map((item) => {
     const distanceScore = clamp01(item?.scores?.distance ?? item?.distance_score);
     const interestScore = clamp01(item?.scores?.interest ?? item?.interest_score);
@@ -1120,11 +1304,13 @@ const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLi
     const blended = sliderScore * (1 - exploreWeight) + exploreSignal * exploreWeight;
 
     const aiAdjust = buildAiAdjustment(item, intent);
-    const aiComposite = blended * 0.8 + baseFinal * 0.2 + aiAdjust.delta;
+    const memoryAdjust = buildTripMemoryAdjustment(item, tripMemory);
+    const aiComposite = blended * 0.8 + baseFinal * 0.2 + aiAdjust.delta + memoryAdjust.delta;
 
     const explanation = [
       ...(Array.isArray(item?.explanations) ? item.explanations : []),
       ...aiAdjust.reasons.map((reason) => ({ tag: reason, contribution: null })),
+      ...memoryAdjust.reasons.map((reason) => ({ tag: reason, contribution: null })),
     ];
 
     return {
@@ -1132,8 +1318,9 @@ const rerankByIntent = ({ items, interestWeight, exploreWeight, intent, outputLi
       ai_meta: {
         blended_score: Number(blended.toFixed(6)),
         ai_delta: Number(aiAdjust.delta.toFixed(6)),
+        memory_delta: Number(memoryAdjust.delta.toFixed(6)),
         ai_final: Number(aiComposite.toFixed(6)),
-        reasons: aiAdjust.reasons,
+        reasons: [...aiAdjust.reasons, ...memoryAdjust.reasons],
       },
       explanations: explanation.slice(0, 6),
     };
@@ -1244,6 +1431,14 @@ const buildSegmentedItinerary = ({ items, intent, route }) => {
   };
 };
 
+const summarizeTripMemory = (tripMemory) => {
+  const visitedCount = Array.isArray(tripMemory?.visitedTargets) ? tripMemory.visitedTargets.length : 0;
+  const skippedCount = Array.isArray(tripMemory?.skippedTargets) ? tripMemory.skippedTargets.length : 0;
+  const savedCount = Array.isArray(tripMemory?.savedPois) ? tripMemory.savedPois.length : 0;
+  if (!visitedCount && !skippedCount && !savedCount) return "No in-trip memory is influencing this draft yet.";
+  return `Trip memory is active: ${visitedCount} visited, ${skippedCount} skipped, ${savedCount} saved places are shaping the next set of recommendations.`;
+};
+
 const buildNarrative = ({
   prompt,
   items,
@@ -1254,6 +1449,8 @@ const buildNarrative = ({
   itinerary,
   knowledgePack,
   llmMode,
+  tripMemory,
+  structuredGuide,
 }) => {
   const list = Array.isArray(items) ? items.slice(0, 6) : [];
   const interestPct = Math.round(clamp(Number(interestWeight) || DEFAULT_INTEREST_WEIGHT, 0, 1) * 100);
@@ -1284,6 +1481,14 @@ const buildNarrative = ({
     lines.push(`Top anchor: ${top.name} (${top.category || "poi"}) with detour ${toMin(top.detour_duration_s)} and route distance ${toKm(top.distance_m)}.`);
   }
 
+  lines.push(summarizeTripMemory(tripMemory));
+
+  if (structuredGuide) {
+    lines.push(`Planning extras: budget ${structuredGuide.budget_band}, weather mode ${structuredGuide.weather_mode}, pace ${structuredGuide.pace}.`);
+    if (structuredGuide.rainy_day_note) lines.push(structuredGuide.rainy_day_note);
+    if (structuredGuide.route_strategy) lines.push(structuredGuide.route_strategy);
+  }
+
   if (insights.length) {
     lines.push("");
     lines.push("Community evidence:");
@@ -1294,6 +1499,14 @@ const buildNarrative = ({
     lines.push("");
     lines.push("Evidence cards:");
     sourceCards.slice(0, 4).forEach((card) => lines.push(`- ${card.type.toUpperCase()} | ${card.title}: ${card.snippet}`));
+  }
+
+  if (Array.isArray(structuredGuide?.alternatives) && structuredGuide.alternatives.length) {
+    lines.push("");
+    lines.push("Fallback alternatives:");
+    structuredGuide.alternatives.forEach((item) => {
+      lines.push(`- ${item.name} (${item.category || "poi"}) | ${toKm(item.distance_m)} | detour ${toMin(item.detour_duration_s)}`);
+    });
   }
 
   lines.push("");
@@ -1467,12 +1680,15 @@ router.post("/planner/stream", async (req, res) => {
     const startPoint = parseLngLat(req.body?.start, DEFAULT_START);
     const endPoint = parseLngLat(req.body?.end, DEFAULT_END);
     const viaPoints = parseViaPoints(req.body?.via);
+    const conversation = normalizeConversationMessages(req.body?.conversation);
+    const tripMemory = buildTripMemoryContext(req.body?.trip_memory);
+    const combinedIntentPrompt = buildCombinedIntentPrompt(prompt, conversation);
 
     const rawInterestWeight = normalizeWeight(req.body?.interest_weight, settings.interestWeight);
     const rawExploreWeight = normalizeWeight(req.body?.explore_weight, settings.exploreWeight);
     const detourTolerance = normalizeWeight(req.body?.detour_tolerance, settings.detourTolerance);
     const effectiveModeDefaults = applyDetourToleranceToModeDefaults(settings.modeDefaults, mode, detourTolerance);
-    const parsedIntent = parsePromptIntent(prompt);
+    const parsedIntent = parsePromptIntent(combinedIntentPrompt);
     const tunedWeights = tuneWeightsByIntent({
       baseInterestWeight: rawInterestWeight,
       baseExploreWeight: rawExploreWeight,
@@ -1512,6 +1728,12 @@ router.post("/planner/stream", async (req, res) => {
         },
         quota,
         category_hint: categoryHint,
+        memory: {
+          conversation_turns: conversation.length,
+          visited_count: tripMemory.visitedTargets.length,
+          skipped_count: tripMemory.skippedTargets.length,
+          saved_count: tripMemory.savedPois.length,
+        },
         scope: {
           supported: false,
           supported_city: SUPPORTED_CITY,
@@ -1636,6 +1858,7 @@ router.post("/planner/stream", async (req, res) => {
       exploreWeight,
       intent: parsedIntent,
       outputLimit: responseLimit,
+      tripMemory,
     });
 
     const itinerary = buildSegmentedItinerary({
@@ -1644,9 +1867,23 @@ router.post("/planner/stream", async (req, res) => {
       route: payload.base_route || null,
     });
 
+    const structuredGuide = buildPlannerStructuredGuide({
+      prompt: combinedIntentPrompt,
+      items: rankedItems,
+      intent: parsedIntent,
+      tripMemory,
+      route: payload.base_route || null,
+    });
+
     const knowledgePack = await buildPlannerKnowledgePack({
-      prompt,
+      prompt: combinedIntentPrompt,
       rankedItems,
+    });
+    const augmentedPromptContext = buildPlannerAugmentedPromptContext({
+      knowledgePack,
+      tripMemory,
+      structuredGuide,
+      conversation,
     });
 
     const llmConfig = getPlannerLlmConfig();
@@ -1672,7 +1909,7 @@ router.post("/planner/stream", async (req, res) => {
         llmResult = await streamPlannerNarrativeFromLlm({
           prompt,
           itinerary,
-          promptContext: knowledgePack.prompt_context,
+          promptContext: augmentedPromptContext,
           interestWeight,
           exploreWeight,
           onToken: (token) => {
@@ -1706,6 +1943,8 @@ router.post("/planner/stream", async (req, res) => {
         itinerary,
         knowledgePack,
         llmMode: "fallback",
+        tripMemory,
+        structuredGuide,
       });
       writeSse(res, "status", { stage: "streaming", message: "Streaming fallback itinerary draft..." });
       await streamText(res, narrative, () => clientClosed);
@@ -1743,6 +1982,12 @@ router.post("/planner/stream", async (req, res) => {
       itinerary,
       items: rankedItems,
       quota,
+      memory: {
+        conversation_turns: conversation.length,
+        visited_count: tripMemory.visitedTargets.length,
+        skipped_count: tripMemory.skippedTargets.length,
+        saved_count: tripMemory.savedPois.length,
+      },
       scope: {
         supported: true,
         supported_city: SUPPORTED_CITY,
@@ -1750,6 +1995,7 @@ router.post("/planner/stream", async (req, res) => {
       retrieval: knowledgePack.stats,
       insights: knowledgePack.insights,
       sources: knowledgePack.cards,
+      structured: structuredGuide,
       llm: {
         configured: llmConfig.configured,
         provider: llmResult.provider || llmConfig.provider,

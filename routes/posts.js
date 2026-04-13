@@ -2,6 +2,7 @@
 import { pool } from "../db/connect.js";
 import { pushNotification } from "./notifications.js";
 import { insertRecommendationEvents } from "../services/reco/events.js";
+import { requireAdminUser } from "../utils/accessGuard.js";
 
 const router = express.Router();
 const DEFAULT_USER_ID = 1; // 若未登录，允许匿名记录到用户1
@@ -223,6 +224,23 @@ async function ensureTables() {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_reports (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      post_id BIGINT NOT NULL,
+      reporter_user_id BIGINT NOT NULL,
+      reason VARCHAR(40) NOT NULL,
+      details VARCHAR(255) NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+      reviewed_by BIGINT NULL,
+      reviewed_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_post_report_user (post_id, reporter_user_id),
+      KEY idx_post_reports_status_created (status, created_at),
+      KEY idx_post_reports_post (post_id, created_at)
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS post_comments (
       id BIGINT AUTO_INCREMENT PRIMARY KEY,
       post_id BIGINT NOT NULL,
@@ -308,6 +326,7 @@ async function ensureTables() {
   await tryAlter(`ALTER TABLE post_trip_meta ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
   await tryAlter(`ALTER TABLE post_trip_meta ADD INDEX idx_post_trip_meta_style_role (trip_style, route_role, post_id)`);
   await tryAlter(`ALTER TABLE post_trip_meta ADD INDEX idx_post_trip_meta_visit_time (visit_time, post_id)`);
+  await tryAlter(`ALTER TABLE posts ADD COLUMN is_featured TINYINT(1) NOT NULL DEFAULT 0`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_owner_created (post_owner_id, created_at, post_id, user_id)`);
   await tryAlter(
     `ALTER TABLE post_favorites ADD INDEX idx_post_favorites_owner_created (post_owner_id, created_at, post_id, user_id)`
@@ -459,6 +478,7 @@ const normalize = (row, imagesMap, tagsMap, poiPhotosMap = new Map(), userMap = 
   cover_image: row.cover_image,
   images: imagesMap.get(row.id) || [],
   tags: tagsMap.get(row.id) || [],
+  is_featured: Number(row.is_featured || 0) > 0,
   like_count: row.like_count || 0,
   favorite_count: row.favorite_count || 0,
   view_count: row.view_count || 0,
@@ -499,6 +519,7 @@ const normalizeCompact = (row, primaryImageMap, tagsMap, userMap = {}, tripMetaM
     cover_image: primaryImage || null,
     images: primaryImage ? [primaryImage] : [],
     tags: tagsMap.get(row.id) || [],
+    is_featured: Number(row.is_featured || 0) > 0,
     like_count: row.like_count || 0,
     favorite_count: row.favorite_count || 0,
     view_count: row.view_count || 0,
@@ -538,10 +559,10 @@ const normalizeFeedLite = (row, primaryImageMap, userMap = {}, tripMetaMap = new
     like_count: row.like_count || 0,
     favorite_count: row.favorite_count || 0,
     view_count: row.view_count || 0,
+    is_featured: Number(row.is_featured || 0) > 0,
     _liked: Number(row.liked_by_viewer || row._liked || 0) > 0,
     _fav: Number(row.favorited_by_viewer || row._fav || 0) > 0,
     created_at: row.created_at,
-    trip_meta: tripMetaMap.get(row.id) || null,
     trip_meta: tripMetaMap.get(row.id) || null,
     poi: row.poi_id
       ? {
@@ -1543,6 +1564,104 @@ router.get("/tags/list", async (_req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error("list tags error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.post("/:id/report", async (req, res) => {
+  try {
+    await ensureTablesReady();
+    const postId = parseInt(req.params.id, 10);
+    const reporterUserId = parseInt(req.body?.user_id || req.query?.user_id || "0", 10);
+    const reason = String(req.body?.reason || "").trim().slice(0, 40);
+    const details = String(req.body?.details || "").replace(/\s+/g, " ").trim().slice(0, 255);
+    if (!postId || !reporterUserId || !reason) {
+      return res.status(400).json({ success: false, message: "post id, user_id and reason are required" });
+    }
+    const [[postRow]] = await pool.query(
+      `SELECT id, user_id FROM posts WHERE id = ? AND COALESCE(status, 'NORMAL') <> 'DELETED' LIMIT 1`,
+      [postId]
+    );
+    if (!postRow?.id) {
+      return res.status(404).json({ success: false, message: "post not found" });
+    }
+    if (Number(postRow.user_id) === Number(reporterUserId)) {
+      return res.status(400).json({ success: false, message: "cannot report your own post" });
+    }
+    await pool.query(
+      `
+        INSERT INTO post_reports (post_id, reporter_user_id, reason, details, status)
+        VALUES (?, ?, ?, ?, 'OPEN')
+        ON DUPLICATE KEY UPDATE
+          reason = VALUES(reason),
+          details = VALUES(details),
+          status = 'OPEN',
+          reviewed_by = NULL,
+          reviewed_at = NULL
+      `,
+      [postId, reporterUserId, reason, details || null]
+    );
+    res.json({ success: true, message: "Report submitted for review." });
+  } catch (err) {
+    console.error("report post error", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.post("/:id/moderate", requireAdminUser, async (req, res) => {
+  try {
+    await ensureTablesReady();
+    const postId = parseInt(req.params.id, 10);
+    if (!postId) {
+      return res.status(400).json({ success: false, message: "invalid post id" });
+    }
+    const nextStatusRaw = String(req.body?.status || "").trim().toUpperCase();
+    const nextStatus = ["NORMAL", "HIDDEN"].includes(nextStatusRaw) ? nextStatusRaw : null;
+    const hasFeatureFlag = req.body && Object.prototype.hasOwnProperty.call(req.body, "is_featured");
+    const featureFlag = hasFeatureFlag ? (req.body.is_featured ? 1 : 0) : null;
+    const reportAction = String(req.body?.report_action || "").trim().toUpperCase();
+    const fields = [];
+    const params = [];
+    if (nextStatus) {
+      fields.push("status = ?");
+      params.push(nextStatus);
+    }
+    if (featureFlag !== null) {
+      fields.push("is_featured = ?");
+      params.push(featureFlag);
+    }
+    if (!fields.length && !["RESOLVED", "DISMISSED"].includes(reportAction)) {
+      return res.status(400).json({ success: false, message: "nothing to update" });
+    }
+    if (fields.length) {
+      params.push(postId);
+      await pool.query(`UPDATE posts SET ${fields.join(", ")} WHERE id = ?`, params);
+    }
+    if (["RESOLVED", "DISMISSED"].includes(reportAction)) {
+      await pool.query(
+        `UPDATE post_reports SET status = ?, reviewed_by = ?, reviewed_at = NOW() WHERE post_id = ? AND status = 'OPEN'`,
+        [reportAction, Number(req.adminUser?.id) || null, postId]
+      );
+    }
+    const [[row]] = await pool.query(
+      `SELECT ${POST_SELECT_FIELDS} FROM posts p LEFT JOIN users u ON p.user_id = u.id LEFT JOIN poi ON p.poi_id = poi.id WHERE p.id = ? LIMIT 1`,
+      [postId]
+    );
+    if (!row) {
+      return res.status(404).json({ success: false, message: "post not found" });
+    }
+    const [imagesMap, tagsMap, poiPhotosMap, tripMetaMap] = await Promise.all([
+      fetchImages([postId]),
+      fetchTags([postId]),
+      fetchPoiPhotosByIds([row?.poi_id], 6),
+      fetchTripMeta([postId]),
+    ]);
+    res.json({
+      success: true,
+      data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap),
+    });
+  } catch (err) {
+    console.error("moderate post error", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });

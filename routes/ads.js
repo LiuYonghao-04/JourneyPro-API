@@ -11,6 +11,8 @@ const TITLE_LIMIT = 56;
 const SUBTITLE_LIMIT = 88;
 const BODY_LIMIT = 220;
 const CTA_TEXT_LIMIT = 20;
+const PLACEMENT_COOLDOWN_SECONDS = 60;
+const SAME_AD_COOLDOWN_MINUTES = 30;
 let ensureAdsSchemaPromise = null;
 const CAMPAIGN_SELECT = `
   SELECT
@@ -220,6 +222,34 @@ async function fetchValidLinkedPost(postId) {
 async function fetchCampaignForAdmin(adId) {
   const [rows] = await pool.query(`${CAMPAIGN_SELECT} WHERE c.id = ? LIMIT 1`, [adId]);
   return rows[0] || null;
+}
+
+async function fetchViewerPlacementCooldown(viewerKey, placement) {
+  const [rows] = await pool.query(
+    `
+      SELECT ad_id, viewed_at
+      FROM ad_impressions
+      WHERE viewer_key = ?
+        AND placement = ?
+      ORDER BY viewed_at DESC
+      LIMIT 1
+    `,
+    [viewerKey, placement]
+  );
+  return rows[0] || null;
+}
+
+async function fetchViewerRecentlySeenAds(viewerKey) {
+  const [rows] = await pool.query(
+    `
+      SELECT DISTINCT ad_id
+      FROM ad_impressions
+      WHERE viewer_key = ?
+        AND viewed_at >= NOW() - INTERVAL ? MINUTE
+    `,
+    [viewerKey, SAME_AD_COOLDOWN_MINUTES]
+  );
+  return new Set(rows.map((row) => Number(row.ad_id)).filter((value) => Number.isFinite(value) && value > 0));
 }
 
 router.get("/mine", requireAdManager, async (req, res) => {
@@ -507,6 +537,26 @@ router.get("/serve", async (req, res) => {
     const placement = normalizePlacement(req.query.placement);
     const viewerUserId = parsePositiveInt(req.query.user_id);
     const viewerKey = buildViewerKey({ userId: viewerUserId, sessionKey: req.query.session_key });
+    const placementCooldown = await fetchViewerPlacementCooldown(viewerKey, placement);
+    if (placementCooldown?.viewed_at) {
+      const viewedAt = new Date(placementCooldown.viewed_at).getTime();
+      const elapsedMs = Date.now() - viewedAt;
+      if (Number.isFinite(elapsedMs) && elapsedMs < PLACEMENT_COOLDOWN_SECONDS * 1000) {
+        const remainingSeconds = Math.max(1, Math.ceil((PLACEMENT_COOLDOWN_SECONDS * 1000 - elapsedMs) / 1000));
+        return res.json({
+          success: true,
+          item: null,
+          throttled: true,
+          serve_policy: {
+            placement,
+            placement_cooldown_seconds: PLACEMENT_COOLDOWN_SECONDS,
+            same_ad_cooldown_minutes: SAME_AD_COOLDOWN_MINUTES,
+            cooldown_seconds_remaining: remainingSeconds,
+          },
+        });
+      }
+    }
+
     const [rows] = await pool.query(
       `
         ${CAMPAIGN_SELECT}
@@ -526,9 +576,12 @@ router.get("/serve", async (req, res) => {
       return res.json({ success: true, item: null });
     }
 
+    const recentlySeenAdIds = await fetchViewerRecentlySeenAds(viewerKey);
     const candidates = rows.map(mapAdRow);
+    const filteredCandidates = candidates.filter((item) => !recentlySeenAdIds.has(Number(item.id)));
+    const serveCandidates = filteredCandidates.length ? filteredCandidates : candidates;
     const hashSeed = [...viewerKey].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-    const selected = candidates[hashSeed % candidates.length] || candidates[0];
+    const selected = serveCandidates[hashSeed % serveCandidates.length] || serveCandidates[0];
 
     await pool.query(
       `INSERT INTO ad_impressions (ad_id, user_id, viewer_key, placement) VALUES (?, ?, ?, ?)`,
@@ -546,7 +599,17 @@ router.get("/serve", async (req, res) => {
       [selected.id]
     );
 
-    res.json({ success: true, item: selected });
+    res.json({
+      success: true,
+      item: selected,
+      throttled: false,
+      serve_policy: {
+        placement,
+        placement_cooldown_seconds: PLACEMENT_COOLDOWN_SECONDS,
+        same_ad_cooldown_minutes: SAME_AD_COOLDOWN_MINUTES,
+        recycled_recent_candidate: filteredCandidates.length === 0 && recentlySeenAdIds.size > 0,
+      },
+    });
   } catch (err) {
     console.error("ads serve error", err);
     res.status(500).json({ success: false, message: "Failed to serve popup ad." });

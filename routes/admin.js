@@ -228,6 +228,37 @@ async function fetchOverviewData() {
         LIMIT 10
       `
     ),
+    pool.query(
+      `
+        SELECT
+          SUM(CASE WHEN is_featured = 1 AND COALESCE(status, 'NORMAL') = 'NORMAL' THEN 1 ELSE 0 END) AS featured_posts,
+          SUM(CASE WHEN COALESCE(status, 'NORMAL') = 'HIDDEN' THEN 1 ELSE 0 END) AS hidden_posts,
+          (SELECT COUNT(*) FROM post_reports WHERE status = 'OPEN') AS open_reports,
+          (SELECT COUNT(*) FROM post_reports) AS total_reports
+        FROM posts
+      `
+    ),
+    pool.query(
+      `
+        SELECT
+          pr.id,
+          pr.post_id,
+          pr.reason,
+          pr.details,
+          pr.status,
+          pr.created_at,
+          p.title,
+          p.status AS post_status,
+          p.is_featured,
+          reporter.nickname AS reporter_nickname
+        FROM post_reports pr
+        JOIN posts p ON p.id = pr.post_id
+        LEFT JOIN users reporter ON reporter.id = pr.reporter_user_id
+        WHERE pr.status = 'OPEN'
+        ORDER BY pr.created_at DESC, pr.id DESC
+        LIMIT 10
+      `
+    ),
   ]);
 
   const approxMap = settled[3]?.status === "fulfilled" ? settled[3].value : new Map();
@@ -238,6 +269,7 @@ async function fetchOverviewData() {
   const roleSnapshot = settled[8]?.status === "fulfilled" ? safeRows(settled[8].value)?.[0] || {} : {};
   const membershipSnapshot = settled[9]?.status === "fulfilled" ? safeRows(settled[9].value)?.[0] || {} : {};
   const adsSnapshot = settled[12]?.status === "fulfilled" ? safeRows(settled[12].value)?.[0] || {} : {};
+  const governanceSnapshot = settled[15]?.status === "fulfilled" ? safeRows(settled[15].value)?.[0] || {} : {};
 
   return {
     totals: {
@@ -310,6 +342,21 @@ async function fetchOverviewData() {
         ? safeRows(settled[14].value).map((row) => ({
             ...row,
             id: safeNumber(row.id),
+          }))
+        : [],
+    post_governance: {
+      featured_posts: safeNumber(governanceSnapshot.featured_posts),
+      hidden_posts: safeNumber(governanceSnapshot.hidden_posts),
+      open_reports: safeNumber(governanceSnapshot.open_reports),
+      total_reports: safeNumber(governanceSnapshot.total_reports),
+    },
+    post_report_queue:
+      settled[16]?.status === "fulfilled"
+        ? safeRows(settled[16].value).map((row) => ({
+            ...row,
+            id: safeNumber(row.id),
+            post_id: safeNumber(row.post_id),
+            is_featured: safeNumber(row.is_featured) > 0,
           }))
         : [],
     top_posts: settled[6]?.status === "fulfilled" ? safeRows(settled[6].value) : [],
