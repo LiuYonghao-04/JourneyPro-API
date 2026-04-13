@@ -1,6 +1,6 @@
 ﻿import express from "express";
 import { pool } from "../db/connect.js";
-import { pushNotification } from "./notifications.js";
+import { createNotificationEvent, pushNotification } from "./notifications.js";
 import { insertRecommendationEvents } from "../services/reco/events.js";
 import { requireAdminUser } from "../utils/accessGuard.js";
 
@@ -584,6 +584,104 @@ const normalizeFeedLite = (row, primaryImageMap, userMap = {}, tripMetaMap = new
 async function fetchUserProfile(userId) {
   const [[u]] = await pool.query(`SELECT id, nickname, avatar_url FROM users WHERE id = ? LIMIT 1`, [userId]);
   return u || { id: userId, nickname: "旅人", avatar_url: null };
+}
+
+function formatReportReason(reason) {
+  const normalized = String(reason || "").trim().toUpperCase();
+  if (!normalized) return "reported content";
+  const labels = {
+    SPAM: "spam",
+    DUPLICATE: "duplicate content",
+    MISLEADING: "misleading content",
+    UNSAFE: "unsafe content",
+    HARASSMENT: "harassment",
+    COPYRIGHT: "copyright concern",
+    OTHER: "reported content",
+  };
+  return labels[normalized] || normalized.toLowerCase().replace(/_/g, " ");
+}
+
+async function notifyReportSubmitted({ reporterUserId, postId, postTitle, reason, details }) {
+  try {
+    const reasonLabel = formatReportReason(reason);
+    const note = details ? ` Details: ${String(details).trim().slice(0, 180)}` : "";
+    await createNotificationEvent({
+      userId: reporterUserId,
+      type: "report",
+      actorName: "System",
+      postId,
+      title: postTitle,
+      content: `Your report has been submitted and queued for review for ${reasonLabel}.${note}`,
+      meta: {
+        event: "submitted",
+        reason: String(reason || "").trim().toUpperCase() || null,
+      },
+    });
+  } catch (err) {
+    console.warn("report submit notification failed:", err?.message || err);
+  }
+}
+
+async function notifyReportReviewed({
+  reporterUserId,
+  adminUser,
+  postId,
+  postTitle,
+  resolution,
+  nextStatus,
+}) {
+  try {
+    const normalizedResolution = String(resolution || "").trim().toUpperCase();
+    const normalizedStatus = String(nextStatus || "").trim().toUpperCase();
+    const content =
+      normalizedResolution === "DISMISSED"
+        ? "Your report was reviewed and dismissed. The post remains visible."
+        : normalizedStatus === "HIDDEN"
+          ? "Your report was upheld. The post has been hidden after review."
+          : "Your report was reviewed and resolved by an admin.";
+    await createNotificationEvent({
+      userId: reporterUserId,
+      type: "report",
+      actorId: adminUser?.id || null,
+      actorName: adminUser?.nickname || "Admin",
+      actorAvatarUrl: adminUser?.avatar_url || null,
+      postId,
+      title: postTitle,
+      content,
+      meta: {
+        event: "reviewed",
+        resolution: normalizedResolution || null,
+        post_status: normalizedStatus || null,
+      },
+    });
+  } catch (err) {
+    console.warn("report review notification failed:", err?.message || err);
+  }
+}
+
+async function notifyPostOwnerModerated({ ownerUserId, adminUser, postId, postTitle, reporterCount }) {
+  try {
+    const count = Number(reporterCount) || 0;
+    const plural = count > 1 ? `${count} reports` : "a report";
+    await createNotificationEvent({
+      userId: ownerUserId,
+      type: "report",
+      actorId: adminUser?.id || null,
+      actorName: adminUser?.nickname || "Admin",
+      actorAvatarUrl: adminUser?.avatar_url || null,
+      postId,
+      title: postTitle,
+      content: `Your post was hidden after ${plural} were reviewed by an admin.`,
+      meta: {
+        event: "owner_hidden",
+        resolution: "RESOLVED",
+        post_status: "HIDDEN",
+        reporter_count: count,
+      },
+    });
+  } catch (err) {
+    console.warn("post owner moderation notification failed:", err?.message || err);
+  }
 }
 
 async function logRecoPostEvent({ eventType, userId, poiId, postId, eventValue = 1 }) {
@@ -1579,7 +1677,7 @@ router.post("/:id/report", async (req, res) => {
       return res.status(400).json({ success: false, message: "post id, user_id and reason are required" });
     }
     const [[postRow]] = await pool.query(
-      `SELECT id, user_id FROM posts WHERE id = ? AND COALESCE(status, 'NORMAL') <> 'DELETED' LIMIT 1`,
+      `SELECT id, user_id, title FROM posts WHERE id = ? AND COALESCE(status, 'NORMAL') <> 'DELETED' LIMIT 1`,
       [postId]
     );
     if (!postRow?.id) {
@@ -1601,6 +1699,13 @@ router.post("/:id/report", async (req, res) => {
       `,
       [postId, reporterUserId, reason, details || null]
     );
+    await notifyReportSubmitted({
+      reporterUserId,
+      postId,
+      postTitle: postRow.title || "Reported post",
+      reason,
+      details,
+    });
     res.json({ success: true, message: "Report submitted for review." });
   } catch (err) {
     console.error("report post error", err);
@@ -1620,6 +1725,13 @@ router.post("/:id/moderate", requireAdminUser, async (req, res) => {
     const hasFeatureFlag = req.body && Object.prototype.hasOwnProperty.call(req.body, "is_featured");
     const featureFlag = hasFeatureFlag ? (req.body.is_featured ? 1 : 0) : null;
     const reportAction = String(req.body?.report_action || "").trim().toUpperCase();
+    const [openReportRows] =
+      ["RESOLVED", "DISMISSED"].includes(reportAction)
+        ? await pool.query(
+            `SELECT reporter_user_id, reason, details FROM post_reports WHERE post_id = ? AND status = 'OPEN' ORDER BY id ASC`,
+            [postId]
+          )
+        : [[]];
     const fields = [];
     const params = [];
     if (nextStatus) {
@@ -1656,6 +1768,34 @@ router.post("/:id/moderate", requireAdminUser, async (req, res) => {
       fetchPoiPhotosByIds([row?.poi_id], 6),
       fetchTripMeta([postId]),
     ]);
+    if (["RESOLVED", "DISMISSED"].includes(reportAction) && Array.isArray(openReportRows) && openReportRows.length) {
+      await Promise.allSettled(
+        openReportRows.map((report) =>
+          notifyReportReviewed({
+            reporterUserId: Number(report.reporter_user_id),
+            adminUser: req.adminUser || null,
+            postId,
+            postTitle: row.title || "Reported post",
+            resolution: reportAction,
+            nextStatus: nextStatus || row.status || null,
+          })
+        )
+      );
+    }
+    if (
+      reportAction === "RESOLVED" &&
+      nextStatus === "HIDDEN" &&
+      row.user_id &&
+      Number(row.user_id) !== Number(req.adminUser?.id || 0)
+    ) {
+      await notifyPostOwnerModerated({
+        ownerUserId: Number(row.user_id),
+        adminUser: req.adminUser || null,
+        postId,
+        postTitle: row.title || "Moderated post",
+        reporterCount: Array.isArray(openReportRows) ? openReportRows.length : 0,
+      });
+    }
     res.json({
       success: true,
       data: normalize(row, imagesMap, tagsMap, poiPhotosMap, {}, tripMetaMap),

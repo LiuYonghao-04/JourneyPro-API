@@ -132,15 +132,35 @@ async function ensureTables() {
       read_like_at DATETIME NULL,
       read_favorite_at DATETIME NULL,
       read_comment_at DATETIME NULL,
+      read_report_at DATETIME NULL,
       read_follow_at DATETIME NULL,
       read_chat_at DATETIME NULL,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notification_events (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      type VARCHAR(20) NOT NULL,
+      actor_id BIGINT NULL,
+      actor_name VARCHAR(80) NULL,
+      actor_avatar_url VARCHAR(255) NULL,
+      post_id BIGINT NULL,
+      comment_id BIGINT NULL,
+      title VARCHAR(160) NULL,
+      content VARCHAR(500) NULL,
+      meta_json LONGTEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_notification_events_user_created (user_id, created_at, id),
+      KEY idx_notification_events_user_type_created (user_id, type, created_at, id)
     );
   `);
 
   await tryAlter(`ALTER TABLE post_likes ADD COLUMN post_owner_id BIGINT NULL`);
   await tryAlter(`ALTER TABLE post_favorites ADD COLUMN post_owner_id BIGINT NULL`);
   await tryAlter(`ALTER TABLE post_comments ADD COLUMN post_owner_id BIGINT NULL`);
+  await tryAlter(`ALTER TABLE user_notification_state ADD COLUMN read_report_at DATETIME NULL`);
   await tryAlter(`ALTER TABLE post_likes ADD INDEX idx_post_likes_created (created_at, post_id, user_id)`);
   await tryAlter(`ALTER TABLE post_favorites ADD INDEX idx_post_favorites_created (created_at, post_id, user_id)`);
   await tryAlter(`ALTER TABLE post_comments ADD INDEX idx_post_comments_created (created_at, post_id, user_id)`);
@@ -171,6 +191,7 @@ const EMPTY_STATE = {
   read_like_at: null,
   read_favorite_at: null,
   read_comment_at: null,
+  read_report_at: null,
   read_follow_at: null,
   read_chat_at: null,
 };
@@ -181,17 +202,28 @@ const mapState = (row) => ({
   read_like_at: row?.read_like_at || null,
   read_favorite_at: row?.read_favorite_at || null,
   read_comment_at: row?.read_comment_at || null,
+  read_report_at: row?.read_report_at || null,
   read_follow_at: row?.read_follow_at || null,
   read_chat_at: row?.read_chat_at || null,
 });
 
 async function fetchNotificationState(userId) {
   const [[row]] = await pool.query(
-    `SELECT read_all_at, read_like_at, read_favorite_at, read_comment_at, read_follow_at, read_chat_at
+    `SELECT read_all_at, read_like_at, read_favorite_at, read_comment_at, read_report_at, read_follow_at, read_chat_at
      FROM user_notification_state WHERE user_id = ? LIMIT 1`,
     [userId]
   );
   return row ? mapState(row) : { ...EMPTY_STATE };
+}
+
+function parseNotificationMeta(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return null;
+  }
 }
 
 function isUnread(item, state) {
@@ -244,15 +276,17 @@ function rebalanceAllNotifications(rows, limit) {
     like: Math.max(8, Math.ceil(limit * 0.45)),
     favorite: Math.max(6, Math.ceil(limit * 0.3)),
     comment: Math.max(10, Math.ceil(limit * 0.55)),
+    report: Math.max(6, Math.ceil(limit * 0.28)),
     follow: Math.max(4, Math.ceil(limit * 0.22)),
   };
   const mins = {
     like: Math.min(8, caps.like),
     favorite: Math.min(6, caps.favorite),
     comment: Math.min(8, caps.comment),
+    report: Math.min(4, caps.report),
     follow: Math.min(4, caps.follow),
   };
-  const countByType = { like: 0, favorite: 0, comment: 0, follow: 0 };
+  const countByType = { like: 0, favorite: 0, comment: 0, report: 0, follow: 0 };
   const selected = [];
   const seen = new Set();
   const pushRow = (row) => {
@@ -320,16 +354,17 @@ router.post("/read", async (req, res) => {
     if (type === "all") {
       await pool.query(
         `INSERT INTO user_notification_state
-         (user_id, read_all_at, read_like_at, read_favorite_at, read_comment_at, read_follow_at, read_chat_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         (user_id, read_all_at, read_like_at, read_favorite_at, read_comment_at, read_report_at, read_follow_at, read_chat_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            read_all_at = VALUES(read_all_at),
            read_like_at = VALUES(read_like_at),
            read_favorite_at = VALUES(read_favorite_at),
            read_comment_at = VALUES(read_comment_at),
+           read_report_at = VALUES(read_report_at),
            read_follow_at = VALUES(read_follow_at),
            read_chat_at = VALUES(read_chat_at)`,
-        [userId, when, when, when, when, when, when]
+        [userId, when, when, when, when, when, when, when]
       );
       const state = await fetchNotificationState(userId);
       return res.json({ success: true, state });
@@ -339,6 +374,7 @@ router.post("/read", async (req, res) => {
       like: "read_like_at",
       favorite: "read_favorite_at",
       comment: "read_comment_at",
+      report: "read_report_at",
       follow: "read_follow_at",
       chat: "read_chat_at",
     };
@@ -371,7 +407,7 @@ router.get("/", async (req, res) => {
     const branchLimit = Math.max(40, Math.min(limit * 2 + 20, 120));
     const commentBranchLimit = Math.max(24, Math.min(limit + 10, 70));
     const type = String(req.query.type || "all").toLowerCase();
-    const allowedTypes = new Set(["all", "like", "favorite", "comment", "follow"]);
+    const allowedTypes = new Set(["all", "like", "favorite", "comment", "report", "follow"]);
     const filterType = allowedTypes.has(type) ? type : "all";
     const unionScanLimit = filterType === "all"
       ? Math.min(Math.max(branchLimit * 4, 180), 520)
@@ -414,7 +450,9 @@ router.get("/", async (req, res) => {
       pieces.push(`
         SELECT * FROM (
           SELECT 'like' AS type, pl.created_at, pl.id AS source_id, pl.user_id AS actor_id,
-                 pl.post_id AS post_id, NULL AS comment_id
+                 pl.post_id AS post_id, NULL AS comment_id,
+                 NULL AS actor_nickname, NULL AS actor_avatar_url,
+                 NULL AS event_title, NULL AS event_content, NULL AS meta_json
           FROM post_likes pl
           WHERE pl.post_owner_id = ? AND pl.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pl.created_at")
@@ -433,7 +471,9 @@ router.get("/", async (req, res) => {
       pieces.push(`
         SELECT * FROM (
           SELECT 'favorite' AS type, pf.created_at, pf.id AS source_id, pf.user_id AS actor_id,
-                 pf.post_id AS post_id, NULL AS comment_id
+                 pf.post_id AS post_id, NULL AS comment_id,
+                 NULL AS actor_nickname, NULL AS actor_avatar_url,
+                 NULL AS event_title, NULL AS event_content, NULL AS meta_json
           FROM post_favorites pf
           WHERE pf.post_owner_id = ? AND pf.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pf.created_at")
@@ -452,7 +492,9 @@ router.get("/", async (req, res) => {
       pieces.push(`
         SELECT * FROM (
           SELECT 'comment' AS type, pc.created_at, pc.id AS source_id, pc.user_id AS actor_id,
-                 pc.post_id AS post_id, pc.id AS comment_id
+                 pc.post_id AS post_id, pc.id AS comment_id,
+                 NULL AS actor_nickname, NULL AS actor_avatar_url,
+                 NULL AS event_title, NULL AS event_content, NULL AS meta_json
           FROM post_comments pc
           WHERE pc.post_owner_id = ? AND pc.user_id <> ? ${sinceSql
             .replaceAll("__CREATED_AT__", "pc.created_at")
@@ -467,11 +509,35 @@ router.get("/", async (req, res) => {
       if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
       if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
     }
+    if (include("report")) {
+      pieces.push(`
+        SELECT * FROM (
+          SELECT 'report' AS type, ne.created_at, ne.id AS source_id, ne.actor_id AS actor_id,
+                 ne.post_id AS post_id, ne.comment_id AS comment_id,
+                 ne.actor_name AS actor_nickname, ne.actor_avatar_url AS actor_avatar_url,
+                 ne.title AS event_title, ne.content AS event_content, ne.meta_json AS meta_json
+          FROM notification_events ne
+          WHERE ne.user_id = ?
+            AND ne.type = 'report' ${sinceSql
+              .replaceAll("__CREATED_AT__", "ne.created_at")
+              .replaceAll("__SOURCE_ID__", "ne.id")}${beforeSql
+              .replaceAll("__CREATED_AT__", "ne.created_at")
+              .replaceAll("__SOURCE_ID__", "ne.id")}
+          ORDER BY ne.created_at DESC, ne.id DESC
+          LIMIT ${branchLimit}
+        ) t_report
+      `);
+      params.push(userId);
+      if (sinceValue) params.push(sinceValue, sinceValue, sinceIdValue);
+      if (beforeValue) params.push(beforeValue, beforeValue, beforeIdValue);
+    }
     if (include("follow")) {
       pieces.push(`
         SELECT * FROM (
           SELECT 'follow' AS type, uf.created_at, uf.id AS source_id, uf.follower_id AS actor_id,
-                 NULL AS post_id, NULL AS comment_id
+                 NULL AS post_id, NULL AS comment_id,
+                 NULL AS actor_nickname, NULL AS actor_avatar_url,
+                 NULL AS event_title, NULL AS event_content, NULL AS meta_json
           FROM user_follows uf
           WHERE uf.following_id = ? ${sinceSql
             .replaceAll("__CREATED_AT__", "uf.created_at")
@@ -498,14 +564,15 @@ router.get("/", async (req, res) => {
         n.created_at,
         n.source_id,
         n.actor_id,
-        u.nickname,
-        u.avatar_url,
+        COALESCE(u.nickname, n.actor_nickname) AS nickname,
+        COALESCE(u.avatar_url, n.actor_avatar_url) AS avatar_url,
         n.post_id,
-        p.title,
+        COALESCE(n.event_title, p.title) AS title,
         CASE
           WHEN n.type = 'comment' THEN LEFT(COALESCE(pc.content, ''), 260)
-          ELSE NULL
-        END AS content
+          ELSE n.event_content
+        END AS content,
+        n.meta_json
       FROM (
         ${pieces.join("\nUNION ALL\n")}
       ) AS n
@@ -526,6 +593,7 @@ router.get("/", async (req, res) => {
     const state = await fetchNotificationState(userId);
     const data = rankedRows.map((item) => ({
       ...item,
+      meta: parseNotificationMeta(item.meta_json),
       unread: isUnread(item, state),
     }));
     const latestCursor = data.length
@@ -568,6 +636,69 @@ export function pushNotification(targetUserId, payload) {
       // ignore broken pipe; cleanup on close
     }
   });
+}
+
+export async function createNotificationEvent({
+  userId,
+  type,
+  actorId = null,
+  actorName = null,
+  actorAvatarUrl = null,
+  postId = null,
+  commentId = null,
+  title = null,
+  content = null,
+  meta = null,
+  createdAt = new Date(),
+} = {}) {
+  const targetUserId = Number(userId);
+  const notificationType = String(type || "").trim().toLowerCase();
+  if (!Number.isFinite(targetUserId) || targetUserId <= 0 || !notificationType) return null;
+
+  await ensureTablesReady();
+  const createdAtValue = toMysqlLocalDatetime(createdAt) || toMysqlLocalDatetime(new Date());
+  const metaJson = meta ? JSON.stringify(meta) : null;
+  const [result] = await pool.query(
+    `
+      INSERT INTO notification_events (
+        user_id, type, actor_id, actor_name, actor_avatar_url,
+        post_id, comment_id, title, content, meta_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      targetUserId,
+      notificationType,
+      actorId ? Number(actorId) : null,
+      actorName ? String(actorName).trim().slice(0, 80) : null,
+      actorAvatarUrl ? String(actorAvatarUrl).trim().slice(0, 255) : null,
+      postId ? Number(postId) : null,
+      commentId ? Number(commentId) : null,
+      title ? String(title).trim().slice(0, 160) : null,
+      content ? String(content).trim().slice(0, 500) : null,
+      metaJson,
+      createdAtValue,
+    ]
+  );
+
+  const payload = {
+    type: notificationType,
+    source_id: Number(result?.insertId || 0) || null,
+    actor_id: actorId ? Number(actorId) : null,
+    actor_nickname: actorName || null,
+    actor_avatar: actorAvatarUrl || null,
+    nickname: actorName || null,
+    avatar_url: actorAvatarUrl || null,
+    post_id: postId ? Number(postId) : null,
+    comment_id: commentId ? Number(commentId) : null,
+    title: title || null,
+    content: content || null,
+    meta: meta || null,
+    created_at: createdAtValue,
+  };
+
+  pushNotification(targetUserId, payload);
+  return payload;
 }
 
 router.get("/stream", async (req, res) => {
