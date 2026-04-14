@@ -19,6 +19,10 @@ JourneyPro API is the Node.js backend for the JourneyPro graduation project. It 
 
 - JWT-based auth + bcrypt password hashing + captcha
 - Community module: posts, tags, likes, favorites, nested comments, follow relationships
+- Admin ops surface:
+  - error inbox for frontend/runtime/API failures
+  - live VIP/SVIP monthly and yearly pricing controls
+  - backup freshness + scheduled-task visibility for release operations
 - Notifications:
   - REST list API
   - SSE stream (`/api/notifications/stream`) for real-time updates
@@ -199,6 +203,15 @@ Base path: `/api`
 
 - `GET /api/ops/health`
 - `GET /api/ops/metrics`
+- `POST /api/ops/client-errors` for frontend/runtime error intake
+
+### Admin ops
+
+- `GET /api/admin/ops/errors?user_id=1`
+- `POST /api/admin/ops/errors/:id/status`
+- `GET /api/admin/ops/pricing?user_id=1`
+- `PUT /api/admin/ops/pricing?user_id=1`
+- `GET /api/admin/ops/maintenance?user_id=1`
 
 ### Chat
 
@@ -251,6 +264,15 @@ For production-like stability on large datasets, this repo now includes two sche
 
 - Hourly `post_comments` hot-table archive sweep (incremental, capped by batch size)
 - Daily DB health + redundant index compaction check/apply
+- Daily snapshot backup as part of the DB maintenance runner
+
+The admin ops page consumes the same scheduler state and backup manifest information exposed by
+`GET /api/admin/ops/maintenance`, so operators can verify:
+
+- whether the backup snapshot is still fresh
+- whether Windows scheduled tasks are installed and enabled
+- what the next run time is for each maintenance job
+- the latest maintenance log tail without opening the server filesystem
 
 ## AI planner stack
 
@@ -317,6 +339,17 @@ Maintenance logs are written to:
 - `JourneyPro-api/logs/maintenance/comments_archive_hot_YYYYMMDD.log`
 - `JourneyPro-api/logs/maintenance/db_maintenance_daily_YYYYMMDD.log`
 
+### Backup snapshot output
+
+Snapshot backups are written to:
+
+- `JourneyPro-api/backups/<timestamp>/manifest.json`
+- `JourneyPro-api/backups/<timestamp>/schema.sql`
+- `JourneyPro-api/backups/<timestamp>/*.ndjson`
+
+`manifest.json` is the source used by the admin ops page to show the latest backup folder, age, table count,
+and whether any critical-table dump was truncated.
+
 ## Release hardening
 
 ### Backup first (no-downtime safe snapshot)
@@ -330,6 +363,9 @@ This writes:
 - `backups/<timestamp>/manifest.json`
 - `backups/<timestamp>/schema.sql`
 - `backups/<timestamp>/*.ndjson` for critical tables
+
+Current release flow assumes the admin ops page and the release precheck agree on backup freshness.
+If `release:check` fails on backup age, run a fresh snapshot first or verify the daily maintenance task.
 
 ### Pre-release gates
 
