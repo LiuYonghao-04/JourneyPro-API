@@ -12,6 +12,7 @@ import {
   fetchOpsErrorSummary,
   updateOpsErrorEventStatus,
 } from "../utils/opsCenter.js";
+import { fetchOpsMaintenanceStatus } from "../utils/opsMaintenance.js";
 
 const router = express.Router();
 const OVERVIEW_TTL_MS = 60 * 1000;
@@ -557,6 +558,18 @@ router.get("/ops/pricing", requireAdminUser, async (_req, res) => {
     res.json({ success: true, data: payload });
   } catch (err) {
     console.error("admin ops pricing fetch failed", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.get("/ops/maintenance", requireAdminUser, async (req, res) => {
+  try {
+    const data = await fetchOpsMaintenanceStatus({
+      freshHours: req.query.fresh_hours,
+    });
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("admin ops maintenance fetch failed", err);
     res.status(500).json({ success: false, message: "server error" });
   }
 });
