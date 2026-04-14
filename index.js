@@ -23,6 +23,7 @@ import tripsRouter from "./routes/trips.js";
 import adminRouter from "./routes/admin.js";
 import adsRouter from "./routes/ads.js";
 import membershipRouter from "./routes/membership.js";
+import opsRouter from "./routes/ops.js";
 
 const app = express();
 app.use(cors());
@@ -206,6 +207,7 @@ app.get("/api/ops/metrics", opsGuard, (_req, res) => {
     endpoints: endpoints.slice(0, 60),
   });
 });
+app.use("/api/ops", opsRouter);
 
 app.use("/api/route", routeRouter);
 app.use("/api/auth", authRouter);

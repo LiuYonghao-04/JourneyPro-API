@@ -2,36 +2,13 @@ import express from "express";
 import { pool } from "../db/connect.js";
 import { ensureUserAccessSchema, fetchUserAccessById, USER_ROLES, getRoleMeta } from "../utils/userAccess.js";
 import { fetchAiQuotaHistory, fetchAiQuotaStatus } from "../services/ai/quota.js";
+import {
+  BILLING_CYCLES,
+  ensureMembershipPricingSchema,
+  fetchMembershipPlanCatalog,
+} from "../utils/membershipPricing.js";
 
 const router = express.Router();
-
-const BILLING_CYCLES = {
-  MONTHLY: { code: "MONTHLY", label: "Monthly", months: 1 },
-  YEARLY: { code: "YEARLY", label: "Yearly", months: 12 },
-};
-
-const PLAN_CATALOG = {
-  [USER_ROLES.VIP]: {
-    role: USER_ROLES.VIP,
-    name: "VIP",
-    tagline: "More AI planning room for regular travelers.",
-    prices: {
-      [BILLING_CYCLES.MONTHLY.code]: 19,
-      [BILLING_CYCLES.YEARLY.code]: 188,
-    },
-    benefits: ["30 AI plans per month", "Priority membership badge", "Membership renewal history"],
-  },
-  [USER_ROLES.SVIP]: {
-    role: USER_ROLES.SVIP,
-    name: "SVIP",
-    tagline: "Unlimited AI access and ad publishing tools.",
-    prices: {
-      [BILLING_CYCLES.MONTHLY.code]: 99,
-      [BILLING_CYCLES.YEARLY.code]: 988,
-    },
-    benefits: ["Unlimited AI plans", "Up to 3 ad campaigns per month", "Premium membership badge"],
-  },
-};
 
 let ensureMembershipSchemaPromise = null;
 
@@ -85,8 +62,8 @@ const decoratePlanPrice = (plan, cycleCode) => {
   };
 };
 
-const formatPlans = () =>
-  Object.values(PLAN_CATALOG).map((plan) => ({
+const formatPlans = (catalog) =>
+  Object.values(catalog || {}).map((plan) => ({
     ...plan,
     pricing: [
       decoratePlanPrice(plan, BILLING_CYCLES.MONTHLY.code),
@@ -111,6 +88,7 @@ async function tryAlter(sql) {
 
 async function ensureMembershipSchema() {
   await ensureUserAccessSchema();
+  await ensureMembershipPricingSchema();
   await pool.query(`
     CREATE TABLE IF NOT EXISTS membership_orders (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -244,16 +222,17 @@ router.get("/summary", async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, message: "user not found" });
     }
-    const [orders, walletLedger, aiQuota, aiUsageHistory] = await Promise.all([
+    const [orders, walletLedger, aiQuota, aiUsageHistory, planCatalog] = await Promise.all([
       fetchMembershipOrders(user.id, 10),
       fetchWalletLedger(user.id, 12),
       fetchAiQuotaStatus({ userId: user.id }),
       fetchAiQuotaHistory({ userId: user.id, limit: 6 }),
+      fetchMembershipPlanCatalog(),
     ]);
     res.json({
       success: true,
       user,
-      plans: formatPlans(),
+      plans: formatPlans(planCatalog),
       orders,
       wallet_ledger: walletLedger,
       ai_quota: aiQuota,
@@ -286,13 +265,16 @@ router.post("/purchase", async (req, res) => {
     return res.status(400).json({ success: false, message: "billing_cycle must be MONTHLY or YEARLY" });
   }
 
-  const cycle = BILLING_CYCLES[billingCycle];
-  const plan = PLAN_CATALOG[targetRole];
-  const amount = Number(plan.prices[billingCycle] || 0);
-
   const conn = await pool.getConnection();
   try {
     await ensureMembershipSchemaReady();
+    const planCatalog = await fetchMembershipPlanCatalog(conn);
+    const cycle = BILLING_CYCLES[billingCycle];
+    const plan = planCatalog[targetRole];
+    const amount = Number(plan?.prices?.[billingCycle] || 0);
+    if (!plan || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: "pricing is not configured for this plan" });
+    }
     await conn.beginTransaction();
     const [rows] = await conn.query(
       `
@@ -438,7 +420,7 @@ router.post("/purchase", async (req, res) => {
       success: true,
       user: refreshedUser,
       order: latestOrder,
-      plans: formatPlans(),
+      plans: formatPlans(planCatalog),
       orders,
       wallet_ledger: walletLedger,
       purchased_plan: {

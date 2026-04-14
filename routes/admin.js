@@ -1,6 +1,17 @@
 import express from "express";
 import { pool } from "../db/connect.js";
 import { requireAdminUser } from "../utils/accessGuard.js";
+import {
+  fetchMembershipPlanCatalog,
+  fetchMembershipPlanMatrix,
+  fetchMembershipPriceAudit,
+  updateMembershipPlanPrices,
+} from "../utils/membershipPricing.js";
+import {
+  fetchOpsErrorFeed,
+  fetchOpsErrorSummary,
+  updateOpsErrorEventStatus,
+} from "../utils/opsCenter.js";
 
 const router = express.Router();
 const OVERVIEW_TTL_MS = 60 * 1000;
@@ -402,6 +413,19 @@ async function getCachedOverview(force = false) {
   return overviewInflight;
 }
 
+async function fetchOpsPricingPayload() {
+  const [plans, matrix, audit] = await Promise.all([
+    fetchMembershipPlanCatalog(),
+    fetchMembershipPlanMatrix(),
+    fetchMembershipPriceAudit(12),
+  ]);
+  return {
+    plans: Object.values(plans || {}),
+    matrix,
+    audit,
+  };
+}
+
 router.post("/integrity-sweep", requireAdminUser, async (req, res) => {
   const adminId = Number(req.adminUser?.id) || 0;
   try {
@@ -470,6 +494,92 @@ router.post("/integrity-sweep", requireAdminUser, async (req, res) => {
   } catch (err) {
     console.error("admin integrity sweep error", err);
     res.status(500).json({ success: false, message: "integrity sweep failed" });
+  }
+});
+
+router.get("/ops/errors", requireAdminUser, async (req, res) => {
+  try {
+    const [summary, events] = await Promise.all([
+      fetchOpsErrorSummary(),
+      fetchOpsErrorFeed({
+        status: req.query.status,
+        source: req.query.source,
+        search: req.query.q,
+        limit: req.query.limit,
+      }),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        summary,
+        events,
+      },
+    });
+  } catch (err) {
+    console.error("admin ops errors fetch failed", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.post("/ops/errors/:id/status", requireAdminUser, async (req, res) => {
+  try {
+    await updateOpsErrorEventStatus({
+      eventId: req.params.id,
+      status: req.body?.status,
+      adminNote: req.body?.admin_note,
+      resolvedBy: req.adminUser?.id || null,
+    });
+    const [summary, events] = await Promise.all([
+      fetchOpsErrorSummary(),
+      fetchOpsErrorFeed({
+        status: req.query.status || "ALL",
+        source: req.query.source || "ALL",
+        search: req.query.q || "",
+        limit: req.query.limit || 40,
+      }),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        summary,
+        events,
+      },
+    });
+  } catch (err) {
+    console.error("admin ops error status update failed", err);
+    res.status(500).json({ success: false, message: err?.message || "server error" });
+  }
+});
+
+router.get("/ops/pricing", requireAdminUser, async (_req, res) => {
+  try {
+    const payload = await fetchOpsPricingPayload();
+    res.json({ success: true, data: payload });
+  } catch (err) {
+    console.error("admin ops pricing fetch failed", err);
+    res.status(500).json({ success: false, message: "server error" });
+  }
+});
+
+router.put("/ops/pricing", requireAdminUser, async (req, res) => {
+  try {
+    const result = await updateMembershipPlanPrices({
+      adminUserId: req.adminUser?.id || null,
+      prices: req.body?.prices || [],
+    });
+    overviewCache = { expiresAt: 0, data: null };
+    res.json({
+      success: true,
+      data: {
+        plans: Object.values(result.plans || {}),
+        matrix: result.matrix || [],
+        audit: result.audit || [],
+        changes: result.changes || [],
+      },
+    });
+  } catch (err) {
+    console.error("admin ops pricing update failed", err);
+    res.status(500).json({ success: false, message: err?.message || "server error" });
   }
 });
 
